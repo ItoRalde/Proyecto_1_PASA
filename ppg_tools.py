@@ -254,55 +254,107 @@ def camino_artefacto(seed, M_true, tau=None):
 
     return h  # forma (3, M_true)
 
-def lms_core(d, U, mu, R_inv=None):
-    Nn, L = U.shape 
-    w = np.zeros(L); e = np.zeros(Nn)
+#LMS pero con un mu variable (se utiliza como entrada al sistema) y también se fija si el error diverge
+
+def lms_core(d, U, mu, R_inv = 'none'):
+    Nn, L = U.shape # N es la cantidad de muestras y L el numero de coefficientes en el filtro 
+
+    # creando las matricies para después modificar 
+    w = np.zeros(L)
+    e = np.zeros(Nn)
+
+    # estableciendo el criterio de divergencia
+    DIV_THR = 1e3
+
+    #Lms muestra a muestra
     for n in range(Nn):
         e[n] = d[n] - w @ U[n]
         w = w + mu * e[n] * U[n]
-        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:   # divergió: cortamos
+        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+            # si divegio ya no consideramos los proximos errores 
             e[n:] = np.nan
             return e, True
     return e, False
 
+#Newton LMS pero con un mu variable (se utiliza como entrada al sistema) y también se fija si el error diverge
+
 def newton_core(d, U, mu, R_inv):
-    Nn, L = U.shape
-    w = np.zeros(L); e = np.zeros(Nn)
+    Nn, L = U.shape # N es la cantidad de muestras y L el numero de coefficientes en el filtro 
+
+    # creando las matricies para después modificar 
+    w = np.zeros(L)
+    e = np.zeros(Nn)
+
+    # estableciendo el criterio de divergencia
+    DIV_THR = 1e3
+
+    #Lms muestra a muestra
     for n in range(Nn):
         e[n] = d[n] - w @ U[n]
         w = w + mu * (R_inv @ (e[n] * U[n]))
         if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+            # si divegio ya no consideramos los proximos errores 
             e[n:] = np.nan
             return e, True
     return e, False
 
 ALGOS = {"LMS": lms_core, "Newton-LMS": newton_core}
 
-
-DIV_THR = 1e3     # criterio de divergencia: |e| > 1e3 o no finito
-
 os.makedirs("figuras_mc", exist_ok=True)
 def guardar(nombre):
     plt.savefig(f"figuras_mc/{nombre}.pdf", bbox_inches="tight")
     plt.savefig(f"figuras_mc/{nombre}.png", dpi=200, bbox_inches="tight")
 
+# creas la señal necesaria para después poder utilizar en las simulaciones de montecarlo
+
 def escenario(seed, N, M_true, rho, sigma_v):
+    # N es la cantidad de muestras, M_true es largo real del camino del artefacto
+    # rho: potencia del artefacto relativa a la del latido | sigma_v: desvío del ruido blanco
+
     rng = np.random.default_rng(seed)      # un solo generador para todo el escenario
+
+    #creando una matriz del tiempo y todas las señales simuladas con las funciones q cree antes
     t = np.arange(N)
     s, fh = ppg_simulada(rng, t, FS)       # latido (potencia 1)
     acc, f_c = acc_simulada(rng, t, FS)    # acelerómetro (3, N)
     h = camino_artefacto(rng, M_true)      # camino desconocido (3, M_true)
-    m = build_U(acc, M_true) @ h.reshape(-1)
-    esc = np.sqrt(rho * np.mean(s**2) / np.mean(m**2))   # escala: potencia de m = rho * potencia de s
-    h, m = h * esc, m * esc
-    v = sigma_v * rng.standard_normal(N)
+    v = sigma_v * rng.standard_normal(N)   # ruido blanco (ahora se crea antes de filtrar)
+
+    # mismo preprocesamiento que los datos reales: pasabanda causal de 0.5 a 4 Hz
+    s = bandpass(s)
+    acc = bandpass(acc)
+    v = bandpass(v)
+
+    # volviendo a normalizar como en los datos reales
+    s = s / np.sqrt(np.mean(s**2))   # el latido vuelve a tener potencia 1
+    acc = (acc - acc.mean(axis=1, keepdims=True)) / acc.std(axis=1, keepdims=True)   # media 0 y desvío 1 por eje
+    v = sigma_v * v / np.std(v)      # el ruido filtrado vuelve a tener desvío sigma_v
+
+    m = build_U(acc, M_true) @ h.reshape(-1) #organizando todo para q pueda ser usado
+    esc = np.sqrt(rho * np.mean(s**2) / np.mean(m**2))   # la potencia del artefacto es rho veces la del latido
+
+    # ahora tenes que escalar el artefacto y su "camino"
+    h = h * esc
+    m = m * esc
+
+    # la señal final es el latido, el movimiento y ruido blanco
     d = s + m + v
+
     return dict(d=d, acc=acc, s=s, m=m, h=h, fh=fh, f_c=f_c)
 
 def preparar(esc, M):
-    U = build_U(esc["acc"], M)
-    L = U.shape[1]
-    trR = np.mean(np.sum(U**2, axis=1))                  # estimación de tr(R)
+    # el esc es lo q obtenes cuando creas el escenario y m es el orden del filtro
+
+    # arreglando la señal para que se pueda usar
+    U = build_U(esc["acc"], M) 
+    L = U.shape[1] # el numero de coefficientes del filtro
+
+    trR = np.mean(np.sum(U**2, axis=1))
     R = U.T @ U / len(U)
     R_inv = np.linalg.inv(R + 1e-3 * np.trace(R) / L * np.eye(L))   # con carga diagonal
+    # se le suma a la diagonal 0,1 % del autovalor promedio (tr(R)/L) antes de invertir
+    # los ejes son de banda angosta, así que R tiene autovalores casi nulos y su inversa los amplificaría
+    # la carga diagonal los sube un poco (eigenvalue shifting, como en la materia) a costa de un pequeño sesgo
+
     return dict(U=U, trR=trR, R_inv=R_inv)
+    # todo lo que usan lms_core y newton_core, calculado una sola vez
