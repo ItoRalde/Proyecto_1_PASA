@@ -409,11 +409,65 @@ def evaluar_grabacion(rec, algoritmo, M, x, primary="mean"):
         return np.inf
     return np.mean(abs(bpm_series(e)-bpm))
 
-# debería evaular los algoritmos en varias configs (no esta acabado)
+# debería evaular los algoritmos en varias configs (se tiene q correjir todavía)
 
-def tabla_aae(recs, configs, algoritmos=ALGOS):
+def tabla_aae(recs, configs, algoritmos=ALGOS, primary="mean"):
+    # T - matriz de resultados con cada config para cada algoritmo y grabacion
+    T = {}
+    for nombre in algoritmos:                                 
+        T[nombre] = np.zeros((len(configs), len(recs)))     
+
+    # lista ordenada de los M distintos que aparecen en configs (sin repetidos)
+    Ms = sorted({M for M, _ in configs})
+
+    for r, rec in enumerate(recs):                             
+        # prepara la grabacion (filtra y normaliza) 
+        d, acc, bpm = prepare_recording(rec, primary)
+
+        for M in Ms:                                          
+            # U, trR y R_inv dependen de M pero no de x, entonces se calculan una vez por (grabación, M)
+            prep = preparar({"acc": acc}, M)
+
+            for c, (M_c, x) in enumerate(configs):             # fijandose en todas las configs         
+                if M_c != M:                                   # si esta config usa otro M, se saltea
+                    continue                                  
+
+                for nombre, core in algoritmos.items():        # recorre LMS y Newton-LMS
+                    # corre el algoritmo con mu = x / tr(R); devuelve el error e (la PPG limpia) y si divergió
+                    e, diverge = core(d, prep["U"], x / prep["trR"], prep["R_inv"])
+
+                    if diverge:                                
+                        T[nombre][c, r] = np.inf               
+                    else:
+                        est = bpm_series(e)                    
+                        T[nombre][c, r] = np.mean(np.abs(est - bpm))   
     return T
 
-# debería obtener la connfiguación optimo para cada algoritom (no esta acabado)
+# debería obtener la connfiguación optimo para cada algoritom (se tiene q correjir todavía)
 
-def cv_por_grabacion(T):
+def cv_por_grabacion(T, configs):
+    resultado = {}                                             
+
+    for nombre, A in T.items():                                # todas las configs de los diferentes algoritmos
+        n_rec = A.shape[1]                                     # cantidad de grabaciones = cantidad de folds
+        aae_cv = np.zeros(n_rec)                               # AAE de test de cada fold
+        cfg_por_fold = []                                      # config elegida en cada fold
+
+        # dejas k grabaciones fueras para validar, k-fold validation
+        for train, k in leave_one_recording_out(n_rec):
+            # AAE medio de cada config usando solo las grabaciones de entrenamiento (promedio por filas)
+            aae_train = A[:, train].mean(axis=1)
+            c = np.argmin(aae_train)                           # índice de la config con menor AAE en entrenamiento
+            cfg_por_fold.append(configs[c])                    # guardamos qué config ganó en este fold
+            aae_cv[k] = A[c, k]                                # AAE de esa config en la grabación que quedó afuera
+
+        # mejor config usando todas las grabaciones a la vez (sin separar test)
+        c_glob = np.argmin(A.mean(axis=1))
+
+        resultado[nombre] = dict(aae_cv=aae_cv,                # AAE de test por fold
+                                 aae_cv_medio=aae_cv.mean(),   # promedio de los folds
+                                 cfg_por_fold=cfg_por_fold,    # configs elegidas en cada fold
+                                 cfg_global=configs[c_glob],   # config óptima global (M, x)
+                                 aae_global=A[c_glob].mean())  # AAE medio de esa config sobre todas las grabaciones
+    return resultado
+ 
