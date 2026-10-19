@@ -3,9 +3,10 @@ from pprint import pp
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import butter, sosfilt, sosfiltfilt
+from scipy.signal import butter, sosfilt, sosfiltfilt, welch
 import time, os
 
+# toma todas las señales de accelerometro y las combina, añadiendo zeros para q sea pueda utilizar después
 
 def build_U(acc, M):
     """Fila n = [ejex(n), ejex(n-1), ..., ejex(n-M+1), ejey(n), ..., ejez(n-M+1)] (ceros antes de n=0)."""
@@ -175,6 +176,12 @@ def load_recordings(path):
     return [{"x": z[f"rec{k}_x"], "bpm": z[f"rec{k}_bpm"], "windows": z[f"rec{k}_windows"]}
             for k in range(int(z["n_rec"]))]
 
+# simplemente normaliza una señal de entrada
+
+def norm(x):
+    return (x - x.mean()) / x.std()
+
+
 def prepare_recording(rec, primary="mean", lo=0.5, hi=4.0):
     """
     Devuelve:
@@ -195,6 +202,10 @@ def split_windows(sig, win=WIN, step=STEP):
     """Corta una señal (N,) en ventanas de 8 s cada 2 s. Devuelve (n_ventanas, 1000)."""
     n_win = (len(sig) - win) // step + 1
     return np.stack([sig[k * step : k * step + win] for k in range(n_win)])
+
+# ============================================================================
+# Montecarlo
+# ============================================================================
 
 # Funcion para simular una señal de ppg - es para utilizar después en la simulación de montecarlo
 
@@ -342,6 +353,8 @@ def escenario(seed, N, M_true, rho, sigma_v):
 
     return dict(d=d, acc=acc, s=s, m=m, h=h, fh=fh, f_c=f_c)
 
+#genera todo lo q usan las funciones newton_core y lms_core
+
 def preparar(esc, M):
     # el esc es lo q obtenes cuando creas el escenario y m es el orden del filtro
 
@@ -358,3 +371,49 @@ def preparar(esc, M):
 
     return dict(U=U, trR=trR, R_inv=R_inv)
     # todo lo que usan lms_core y newton_core, calculado una sola vez
+
+
+# ============================================================================
+# COMPARACIÓN SIMULADO VS REAL
+# ============================================================================
+def psd_media(senales, nper=1024):
+    """PSD de Welch promediada sobre una lista de señales. Devuelve (frecuencias [Hz], PSD)."""
+    f, _ = welch(senales[0], fs=FS, nperseg=nper)
+    return f, np.mean([welch(x, fs=FS, nperseg=nper)[1] for x in senales], axis=0)
+
+
+def explicada_y_autovalores(d, acc, M):
+    """
+    Ajusta por Wiener (batch) el mejor FIR de orden M entre el acelerómetro y d.
+    Devuelve (fracción de la potencia de d explicada por el acelerómetro, autovalores de R).
+    """
+    U = build_U(acc, M)
+    L = U.shape[1]
+    R = U.T @ U / len(U)
+    p = U.T @ d / len(U)
+    w = np.linalg.solve(R + 1e-3 * np.trace(R) / L * np.eye(L), p)   # con carga diagonal
+    return 1 - np.var(d - U @ w) / np.var(d), np.linalg.eigvalsh(R)
+
+# ============================================================================
+# Evaluacion con los datos reales
+# ============================================================================
+
+# toma un algoritmo (newton o lms normal), una grabación y calcula el error promedio de bpm utilizando ese algoritmo y la grabacion
+
+def evaluar_grabacion(rec, algoritmo, M, x, primary="mean"):
+    """AAE [BPM] de una grabación con un algoritmo y una configuración (M, x)."""
+    d, acc, bpm = prepare_recording(rec, primary)
+    prep = preparar({"acc": acc}, M)                          # U, trR, R_inv
+    e, diverge = ALGOS[algoritmo](d, prep["U"], x / prep["trR"], prep["R_inv"])
+    if diverge == True:
+        return np.inf
+    return np.mean(abs(bpm_series(e)-bpm))
+
+# debería evaular los algoritmos en varias configs (no esta acabado)
+
+def tabla_aae(recs, configs, algoritmos=ALGOS):
+    return T
+
+# debería obtener la connfiguación optimo para cada algoritom (no esta acabado)
+
+def cv_por_grabacion(T):
