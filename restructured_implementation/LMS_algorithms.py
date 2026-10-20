@@ -87,4 +87,102 @@ def Newton_LMS(ppg1, ppg2, accx, accy, accz, M):
         # actualizando los pesos (utilizando la inversa de la matriz de correlación para el método de Newton)
         w = w + mu * R_inv @ (e[n] * U[n])
     
+    return e, y, 
+
+#gemini implemetation without harcoded hyperparameters:
+'''
+import numpy as np
+
+
+def Newton_LMS(
+    ppg1: np.ndarray,
+    ppg2: np.ndarray,
+    accx: np.ndarray,
+    accy: np.ndarray,
+    accz: np.ndarray,
+    M: int,
+    mu_scale: float = 0.5,
+    reg_factor: float = 1e-4,
+    ppg_mode: str = "mean",
+    include_magnitude: bool = True,
+    center_only: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Newton-LMS adaptive filter with parameterized degrees of freedom for hyperparameter tuning.
+
+    Parameters
+    ----------
+    ppg1, ppg2 : np.ndarray
+        Raw photoplethysmogram channel signals.
+    accx, accy, accz : np.ndarray
+        Tri-axial acceleration reference signals.
+    M : int
+        Filter order (taps per reference channel).
+    mu_scale : float, default=0.5
+        Step-size scaling factor in range (0, 1].
+    reg_factor : float, default=1e-4
+        Diagonal loading coefficient epsilon relative to tr(R) for matrix inversion.
+    ppg_mode : {'mean', 'ppg1', 'ppg2', 'pca'}, default='mean'
+        Fusion strategy for the primary PPG channels.
+    include_magnitude : bool, default=True
+        Whether to append the acceleration norm as a fourth reference signal.
+    center_only : bool, default=False
+        If True, signals are zero-centered without unit-variance scaling.
+    """
+    # 1. Primary PPG Signal Selection / Fusion
+    if ppg_mode == "mean":
+        d = 0.5 * (ppg1 + ppg2)
+    elif ppg_mode == "ppg1":
+        d = ppg1.copy()
+    elif ppg_mode == "ppg2":
+        d = ppg2.copy()
+    elif ppg_mode == "pca":
+        P = np.vstack([ppg1, ppg2])
+        P_centered = P - np.mean(P, axis=1, keepdims=True)
+        _, _, Vt = np.linalg.svd(P_centered, full_matrices=False)
+        d = Vt[0]
+    else:
+        raise ValueError(f"Unknown ppg_mode: {ppg_mode}")
+
+    # PPG Normalization
+    d_mean = np.mean(d)
+    d_scale = 1.0 if center_only else (np.std(d) + 1e-8)
+    d = (d - d_mean) / d_scale
+
+    # 2. Reference Signal Assembly
+    acc_channels = [accx, accy, accz]
+    if include_magnitude:
+        acc_mag = np.sqrt(accx**2 + accy**2 + accz**2)
+        acc_channels.append(acc_mag)
+
+    acc = np.vstack(acc_channels)
+    acc_mean = np.mean(acc, axis=1, keepdims=True)
+    acc_scale = 1.0 if center_only else (np.std(acc, axis=1, keepdims=True) + 1e-8)
+    acc = (acc - acc_mean) / acc_scale
+
+    # 3. Regressor Matrix Construction
+    U = build_U(acc, M)
+    N, P_dim = U.shape
+
+    # 4. Correlation Matrix and Regularized Inversion
+    R = (U.T @ U) / N
+    trR = np.trace(R)
+    epsilon = reg_factor * (trR / P_dim)
+    R_inv = np.linalg.inv(R + epsilon * np.eye(P_dim))
+
+    # 5. Step-Size Calculation
+    mu = mu_scale * (2.0 / (3.0 * trR))
+
+    # 6. Adaptive Filtering Loop
+    w = np.zeros(P_dim)
+    e = np.zeros(N)
+    y = np.zeros(N)
+
+    for n in range(N):
+        u_n = U[n]
+        y[n] = w @ u_n
+        e[n] = d[n] - y[n]
+        w += mu * (R_inv @ (e[n] * u_n))
+
     return e, y, w
+
+'''
