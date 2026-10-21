@@ -98,8 +98,9 @@ restructured_implementation/
   Extracts systolic peaks and computes BPM from the median inter-beat interval.
 - `estimate_bpm_window(e_window, hr_algorithm='periodogram', **hr_params)`:
   Selector bucket function for the HR detector and its sub-parameters.
-- `objective_function(bpm_estimated, bpm_true)`:
-  Computes the Mean Absolute Error (AAE in BPM) across windows.
+- `objective_function(bpm_estimated, bpm_true, rmse_weight=0.35, outlier_threshold=10.0, outlier_weight=0.50)`:
+  Outlier-penalized composite objective combining AAE, RMSE, and a soft hinge
+  penalty on errors exceeding `outlier_threshold` (10 BPM).
 
 --------------------------------------------------------------------------------
 6. JOINT 2-PHASE TPE OPTIMIZATION WITH EARLY PRUNING (optimization.py)
@@ -114,17 +115,24 @@ restructured_implementation/
      * `vs_lms`       -> `M` in [4, 48], `mu_max`, `mu_min`, `alpha`, `gamma`
      * `periodogram`  -> `nfft` in {4096, 8192, 16384}, `window_type` in {'hann', 'hamming', 'blackman'}
      * `elgendi`      -> `w1_sec` in [0.08, 0.16], `w2_sec` in [0.55, 0.85], `beta_offset` in [0.005, 0.10]
+- `preprocess_dataset_windows(X, ...)`:
+  Precomputes bandpass + normalization and the maximal 3D delay tensor `U_max`
+  of shape `(N, 3, 48)` once per window so any filter order `M <= 48` is extracted
+  by slicing `U_max[:, :, :M].reshape(N, 3*M)` without rebuilding `U` in each trial.
 - `ConditionalTPE`:
   Tree-structured Parzen Estimator modeling `l(theta)` and `g(theta)` over the
   hierarchical search space and maximizing Expected Improvement `l(theta) / g(theta)`.
 - `run_phase1_snr_screening(...)`:
   Phase 1 decoupled fast screening of the LMS filter subtree using `estimate_cardiac_snr`
-  as a fast spectral SNR proxy.
+  as a fast spectral SNR proxy, guaranteeing all 3 LMS families are represented.
 - `run_phase2_tpe_optimization(...)` & `MedianFoldPruner`:
   Phase 2 end-to-end joint TPE optimization seeded with Phase 1's top LMS filters,
   evaluated via Subject-Wise Group K-Fold CV with early pruning across folds.
+- `summarize_algorithm_comparisons(phase1_history, phase2_history)`:
+  Extracts the best score for each LMS variant (Phase 1) and each (LMS + HR detector)
+  combination (Phase 2).
 - `optimize_hr_pipeline(X, y, ...)`:
   Executes the full 2-phase optimization and returns `best_model` (`HeartRateEstimatorModel`),
-  `best_hyperparameters`, and `best_score` (AAE in BPM).
+  `best_hyperparameters`, `best_score`, and `comparison_summary`.
 ================================================================================
 

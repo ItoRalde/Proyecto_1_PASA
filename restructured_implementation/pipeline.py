@@ -94,30 +94,7 @@ def predict_window_bpm(
     hr_params: dict | None = None,
     fs: float = FS,
 ) -> float:
-    """Reconstruct the heart signal and estimate BPM for a single 5D window `(5, N)`.
-
-    Parameters
-    ----------
-    window_5d : np.ndarray
-        Single 5D window of shape (5, N).
-    lms_algorithm : {'standard_lms', 'nlms', 'vs_lms'}, default='standard_lms'
-        Chosen adaptive LMS filter variant.
-    M : int, default=16
-        Filter taps per accelerometer axis.
-    lms_params : dict, optional
-        Sub-parameters for the chosen LMS variant (`mu`, `delta`, `mu_max`, etc.).
-    hr_algorithm : {'periodogram', 'elgendi'}, default='periodogram'
-        Chosen heart rate estimation algorithm.
-    hr_params : dict, optional
-        Sub-parameters for the chosen HR estimation algorithm.
-    fs : float, default=125
-        Sampling frequency in Hz.
-
-    Returns
-    -------
-    float
-        Estimated BPM for the window.
-    """
+    """Reconstruct the heart signal and estimate BPM for a single 5D window `(5, N)`."""
     lms_kwargs = dict(lms_params) if lms_params else {}
     hr_kwargs = dict(hr_params) if hr_params else {}
 
@@ -159,26 +136,27 @@ class HeartRateEstimatorModel:
         self.hr_params = dict(hr_params)
         self.fs = fs
 
-    def reconstruct_window(self, window_5d: np.ndarray) -> np.ndarray:
+    def reconstruct_window(
+        self, window_5d: np.ndarray, return_details: bool = False
+    ) -> np.ndarray | tuple[np.ndarray, dict]:
         """Return the reconstructed cardiac signal `e_fused[n]` for a single `(5, N)` window."""
         return reconstruct_heart_signal(
             window_5d,
             lms_algorithm=self.lms_algorithm,
             M=self.M,
             fs=self.fs,
+            return_details=return_details,
             **self.lms_params,
         )
 
     def predict_one(self, window_5d: np.ndarray) -> float:
         """Predict BPM for a single `(5, N)` window."""
-        return predict_window_bpm(
-            window_5d,
-            lms_algorithm=self.lms_algorithm,
-            M=self.M,
-            lms_params=self.lms_params,
+        e_fused = self.reconstruct_window(window_5d, return_details=False)
+        return estimate_bpm_window(
+            e_fused,
             hr_algorithm=self.hr_algorithm,
-            hr_params=self.hr_params,
             fs=self.fs,
+            **self.hr_params,
         )
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -187,3 +165,36 @@ class HeartRateEstimatorModel:
         if X.ndim == 2:
             return np.array([self.predict_one(X)])
         return np.array([self.predict_one(w) for w in X])
+
+    def predict_with_signals(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Predict BPM and return the cleaned signals `e_fused` in a single pass over `X`.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Dataset of windows of shape `(n_windows, 5, N)`.
+
+        Returns
+        -------
+        bpm_preds : np.ndarray
+            Estimated BPM per window of shape `(n_windows,)`.
+        cleaned_signals : np.ndarray
+            Reconstructed cardiac signals of shape `(n_windows, N)`.
+        """
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 2:
+            X = X[np.newaxis, ...]
+        n_win, _, N = X.shape
+        bpm_preds = np.empty(n_win, dtype=float)
+        cleaned_signals = np.empty((n_win, N), dtype=float)
+
+        for i, w in enumerate(X):
+            e_fused = self.reconstruct_window(w, return_details=False)
+            cleaned_signals[i] = e_fused
+            bpm_preds[i] = estimate_bpm_window(
+                e_fused,
+                hr_algorithm=self.hr_algorithm,
+                fs=self.fs,
+                **self.hr_params,
+            )
+        return bpm_preds, cleaned_signals
