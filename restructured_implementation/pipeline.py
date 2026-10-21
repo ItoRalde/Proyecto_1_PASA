@@ -3,21 +3,23 @@ End-to-end heart signal reconstruction and BPM estimation pipeline for individua
 
 Processes each 5-dimensional window `[ppg1, ppg2, accx, accy, accz]` of length N independently:
 1. Preprocessing (`preprocessing.py`):
-   - Butterworth bandpass filter (30 - 240 BPM / 0.5 - 4.0 Hz).
-   - Amplitude normalization (zero mean, unit standard deviation per channel).
+   - Computes 4th non-linear accelerometer magnitude channel `acc_mag`.
+   - Applies 3rd-order zero-phase Butterworth bandpass filter (0.5 - 4.0 Hz / 30 - 240 BPM).
+   - Normalizes all 6 channels to zero mean and unit standard deviation.
 2. Reference Signal Construction (`reference_construction.py`):
-   - MISO delay-line regressor construction: m_hat[n] = sum_{k=1}^3 w_k^T[n] a_k[n].
-3. Adaptive MISO LMS Filtering + Late Fusion (`LMS_algorithms.py` & `fusion.py`):
-   - Parallel filtering of `ppg1` and `ppg2` against `acc` using the chosen LMS variant
-     (`standard_lms`, `nlms`, or `vs_lms`) followed by SNR-Weighted Averaging.
+   - 4M-tap MISO delay-line regressor construction: m_hat[n] = sum_{k=1}^4 w_k^T[n] a_k[n].
+3. Single-Pass Adaptive MISO LMS Filtering + Late Fusion (`LMS_algorithms.py` & `fusion.py`):
+   - Parallel single-pass filtering of `ppg1` and `ppg2` against `acc_norm` (4, N)
+     using the chosen LMS variant (`standard_lms`, `nlms`, or `vs_lms`) followed by
+     Motion-Suppressed SNR-Weighted Averaging.
 4. Heart Rate Detection (`bpm_detection.py`):
-   - Estimates BPM per window via `zero_padded_periodogram_bpm` or `elgendi_systolic_peak_bpm`.
+   - Estimates BPM per window via `motion_suppressed_periodogram_bpm` or `elgendi_systolic_peak_bpm`.
 """
 
 import numpy as np
 
 from .dataset_preparation import FS
-from .preprocessing import preprocess_signal
+from .preprocessing import prepare_channels
 from .LMS_algorithms import lms_bucket
 from .bpm_detection import estimate_bpm_window
 
@@ -29,8 +31,8 @@ def reconstruct_heart_signal(
     lo: float = 0.5,
     hi: float = 4.0,
     fs: float = FS,
-    order: int = 4,
-    causal: bool = True,
+    order: int = 3,
+    causal: bool = False,
     return_details: bool = False,
     **lms_params,
 ) -> np.ndarray | tuple[np.ndarray, dict]:
@@ -39,22 +41,22 @@ def reconstruct_heart_signal(
     Parameters
     ----------
     window_5d : np.ndarray
-        5-dimensional signal window of shape (5, N) with channels
+        5-dimensional signal window of shape `(5, N)` with channels
         `[ppg1, ppg2, accx, accy, accz]`.
     lms_algorithm : {'standard_lms', 'nlms', 'vs_lms'}, default='standard_lms'
-        LMS algorithm variant to execute in the parallel adaptive filtering stage.
+        LMS algorithm variant to execute in the single-pass parallel filtering stage.
     M : int, default=16
-        Number of FIR taps per accelerometer axis (total MISO weights = 3 * M).
+        Number of FIR taps per accelerometer channel (total MISO weights = 4 * M).
     lo : float, default=0.5
         Bandpass lower cutoff frequency in Hz (30 BPM = 0.5 Hz).
     hi : float, default=4.0
         Bandpass upper cutoff frequency in Hz (240 BPM = 4.0 Hz).
     fs : float, default=125
         Sampling frequency in Hz.
-    order : int, default=4
+    order : int, default=3
         Butterworth bandpass filter order.
-    causal : bool, default=True
-        Whether to use causal forward filtering (`sosfilt`).
+    causal : bool, default=False
+        If False (default), uses zero-phase `sosfiltfilt`.
     return_details : bool, default=False
         If True, returns `(e_fused, details_dict)`.
     **lms_params
@@ -66,21 +68,36 @@ def reconstruct_heart_signal(
     Returns
     -------
     e_fused : np.ndarray
-        Cleared and fused cardiac signal window of shape (N,).
+        Cleared and fused cardiac signal window of shape `(N,)`.
     details : dict, optional
-        Returned only when `return_details=True`.
+        Returned only when `return_details=True` (includes `ppg_norm` and `acc_norm`).
     """
-    ppg1, ppg2, acc = preprocess_signal(
-        window_5d, lo=lo, hi=hi, fs=fs, order=order, causal=causal
+    ppg_norm, acc_norm = prepare_channels(
+        window_5d, fs=fs, lo=lo, hi=hi, order=order, causal=causal
     )
+    ppg1, ppg2 = ppg_norm[0], ppg_norm[1]
+
+    if return_details:
+        e_fused, details = lms_bucket(
+            ppg1,
+            ppg2,
+            acc_norm,
+            algorithm=lms_algorithm,
+            M=M,
+            return_details=True,
+            **lms_params,
+        )
+        details["ppg_norm"] = ppg_norm
+        details["acc_norm"] = acc_norm
+        return e_fused, details
 
     return lms_bucket(
         ppg1,
         ppg2,
-        acc,
+        acc_norm,
         algorithm=lms_algorithm,
         M=M,
-        return_details=return_details,
+        return_details=False,
         **lms_params,
     )
 
@@ -98,16 +115,20 @@ def predict_window_bpm(
     lms_kwargs = dict(lms_params) if lms_params else {}
     hr_kwargs = dict(hr_params) if hr_params else {}
 
-    e_fused = reconstruct_heart_signal(
-        window_5d,
-        lms_algorithm=lms_algorithm,
+    ppg_norm, acc_norm = prepare_channels(window_5d, fs=fs)
+    e_fused = lms_bucket(
+        ppg_norm[0],
+        ppg_norm[1],
+        acc_norm,
+        algorithm=lms_algorithm,
         M=M,
-        fs=fs,
+        return_details=False,
         **lms_kwargs,
     )
     return estimate_bpm_window(
         e_fused,
         hr_algorithm=hr_algorithm,
+        acc_norm=acc_norm,
         fs=fs,
         **hr_kwargs,
     )
@@ -116,8 +137,8 @@ def predict_window_bpm(
 class HeartRateEstimatorModel:
     """Configured end-to-end Heart Rate Estimation model encapsulating the optimal pipeline.
 
-    Treats each windowed sequence `(5, N)` individually, making it directly applicable
-    to both validation folds and the test set (`IEEEPPG_TEST.ts`).
+    Treats each windowed sequence `(5, N)` individually in a single forward pass,
+    making it directly applicable to both validation folds and the test set (`IEEEPPG_TEST.ts`).
     """
 
     def __init__(
@@ -151,10 +172,20 @@ class HeartRateEstimatorModel:
 
     def predict_one(self, window_5d: np.ndarray) -> float:
         """Predict BPM for a single `(5, N)` window."""
-        e_fused = self.reconstruct_window(window_5d, return_details=False)
+        ppg_norm, acc_norm = prepare_channels(window_5d, fs=self.fs)
+        e_fused = lms_bucket(
+            ppg_norm[0],
+            ppg_norm[1],
+            acc_norm,
+            algorithm=self.lms_algorithm,
+            M=self.M,
+            return_details=False,
+            **self.lms_params,
+        )
         return estimate_bpm_window(
             e_fused,
             hr_algorithm=self.hr_algorithm,
+            acc_norm=acc_norm,
             fs=self.fs,
             **self.hr_params,
         )
@@ -189,11 +220,21 @@ class HeartRateEstimatorModel:
         cleaned_signals = np.empty((n_win, N), dtype=float)
 
         for i, w in enumerate(X):
-            e_fused = self.reconstruct_window(w, return_details=False)
+            ppg_norm, acc_norm = prepare_channels(w, fs=self.fs)
+            e_fused = lms_bucket(
+                ppg_norm[0],
+                ppg_norm[1],
+                acc_norm,
+                algorithm=self.lms_algorithm,
+                M=self.M,
+                return_details=False,
+                **self.lms_params,
+            )
             cleaned_signals[i] = e_fused
             bpm_preds[i] = estimate_bpm_window(
                 e_fused,
                 hr_algorithm=self.hr_algorithm,
+                acc_norm=acc_norm,
                 fs=self.fs,
                 **self.hr_params,
             )

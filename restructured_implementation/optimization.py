@@ -3,47 +3,49 @@ Joint Hyperparameter Optimization module using a 2-Phase Tree-structured Parzen 
 with Subject-Wise Group K-Fold Cross-Validation and Early Pruning.
 
 Architecture:
-1. Conditional Tree Search Space:
+1. Conditional Tree Search Space (Single-Pass 4M-Tap MISO LMS + HR Detection):
    - Level 1 (Categorical Structure Choices):
      * `lms_algorithm` in {'standard_lms', 'nlms', 'vs_lms'}
      * `hr_algorithm`  in {'periodogram', 'elgendi'}
    - Level 2 (Conditioned Continuous / Discrete Sub-Parameters):
-     * Conditioned on `lms_algorithm`:
-       - `standard_lms`: `M` (discrete), `mu` (log-continuous)
-       - `nlms`:         `M` (discrete), `mu` (log-continuous), `delta` (log-continuous)
-       - `vs_lms`:       `M` (discrete), `mu_max`, `mu_min`, `alpha`, `gamma`
+     * Conditioned on `lms_algorithm` (with M in [8, 24] -> total taps 4M in [32, 96]):
+       - `standard_lms`: `M` in [8, 24], `mu` in [5e-4, 0.02]
+       - `nlms`:         `M` in [8, 24], `mu` in [0.05, 0.8], `delta` in [1e-4, 1e-1]
+       - `vs_lms`:       `M` in [8, 24], `mu_max` in [0.005, 0.08], `mu_min` in [1e-4, 0.005],
+                         `alpha` in [0.90, 0.995], `gamma` in [1e-4, 1e-2]
      * Conditioned on `hr_algorithm`:
-       - `periodogram`:  `nfft` (discrete), `window_type` (categorical)
-       - `elgendi`:      `w1_sec`, `w2_sec`, `beta_offset` (continuous)
+       - `periodogram`:  `nfft` in {8192, 16384}, `window_type` in {'hann', 'hamming', 'blackman'},
+                         `suppression_alpha` in [0.2, 0.85], `harmonic_weight` in [0.1, 0.6]
+       - `elgendi`:      `w1_sec` in [0.08, 0.16], `w2_sec` in [0.55, 0.85],
+                         `beta_offset` in [0.005, 0.10]
 
 2. Validation Protocol:
    - Subject-Wise Group K-Fold (`subject_wise_group_kfold`): partitions windows strictly
      by participant / recording session ID to prevent data leakage.
-   - Each window `(5, 1000)` is filtered and evaluated individually (never merged).
+   - Each window `(5, 1000)` is filtered in a single forward pass and evaluated individually.
 
 3. 2-Phase Bayesian Optimization with Early Pruning:
-   - Phase 1 (Decoupled Fast Screening via Spectral SNR Proxy):
-     Uses TPE to screen LMS filter configurations by maximizing the in-band cardiac
-     Spectral SNR (`estimate_cardiac_snr`) on a subset of individual windows.
+   - Phase 1 (Decoupled Fast Screening via Motion-Suppressed Spectral SNR Proxy):
+     Uses TPE to screen LMS filter configurations by maximizing the motion-suppressed
+     in-band cardiac Spectral SNR (`estimate_cardiac_snr`) on a subset of individual windows.
    - Phase 2 (End-to-End TPE Optimization with Early Pruning):
-     Warm-starts from the top Phase 1 LMS configurations (ensuring all 6 combinations of
-     LMS algorithm x HR detector are evaluated) and jointly optimizes both the LMS filter
-     and the HR detector across Subject-Wise Group K-Fold splits using the outlier-penalized
-     composite `objective_function` and `MedianFoldPruner` early stopping.
+     Warm-starts from the top Phase 1 LMS configurations and jointly optimizes both the
+     LMS filter and the HR detector across Subject-Wise Group K-Fold splits using the
+     outlier-penalized composite `objective_function` and `MedianFoldPruner` early stopping.
 """
 
 import numpy as np
 
 from .dataset_preparation import FS, subject_wise_group_kfold
-from .preprocessing import preprocess_signal
+from .preprocessing import prepare_channels
 from .reference_construction import build_U
 from .LMS_algorithms import LMS_REGISTRY
 from .fusion import estimate_cardiac_snr, snr_weighted_late_fusion
 from .bpm_detection import estimate_bpm_window, objective_function
 from .pipeline import HeartRateEstimatorModel
 
-# Maximum filter order M in the search space (used to pre-allocate delay tensors once)
-MAX_M: int = 48
+# Maximum filter order M in the search space (4 channels * 24 taps = 96 total MISO taps)
+MAX_M: int = 24
 
 # ============================================================================
 # Conditional Tree Hyperparameter Search Space Definition
@@ -53,26 +55,28 @@ CONDITIONAL_SEARCH_SPACE: dict = {
     "hr_algorithm": ["periodogram", "elgendi"],
     "lms_subspaces": {
         "standard_lms": {
-            "M": ("int", 4, MAX_M),
-            "mu": ("log_float", 1e-5, 5e-2),
+            "M": ("int", 8, MAX_M),
+            "mu": ("log_float", 5e-4, 2e-2),
         },
         "nlms": {
-            "M": ("int", 4, MAX_M),
-            "mu": ("log_float", 1e-3, 1.5),
-            "delta": ("log_float", 1e-7, 1e-1),
+            "M": ("int", 8, MAX_M),
+            "mu": ("log_float", 0.05, 0.8),
+            "delta": ("log_float", 1e-4, 1e-1),
         },
         "vs_lms": {
-            "M": ("int", 4, MAX_M),
-            "mu_max": ("log_float", 1e-3, 5e-2),
-            "mu_min": ("log_float", 1e-6, 1e-3),
-            "alpha": ("float", 0.90, 0.999),
-            "gamma": ("log_float", 1e-5, 1e-2),
+            "M": ("int", 8, MAX_M),
+            "mu_max": ("log_float", 0.005, 0.08),
+            "mu_min": ("log_float", 1e-4, 0.005),
+            "alpha": ("float", 0.90, 0.995),
+            "gamma": ("log_float", 1e-4, 1e-2),
         },
     },
     "hr_subspaces": {
         "periodogram": {
-            "nfft": ("choice", [4096, 8192, 16384]),
+            "nfft": ("choice", [8192, 16384]),
             "window_type": ("choice", ["hann", "hamming", "blackman"]),
+            "suppression_alpha": ("float", 0.2, 0.85),
+            "harmonic_weight": ("float", 0.1, 0.6),
         },
         "elgendi": {
             "w1_sec": ("float", 0.08, 0.16),
@@ -232,7 +236,7 @@ class ConditionalTPE:
                 lms_params[pname] = self._sample_param_prior(pspec)
 
         if lms_algo == "vs_lms" and lms_params["mu_min"] >= lms_params["mu_max"]:
-            lms_params["mu_min"] = lms_params["mu_max"] * 0.1
+            lms_params["mu_min"] = min(lms_params["mu_min"], lms_params["mu_max"] * 0.25)
 
         return {"lms_algorithm": lms_algo, "lms_params": lms_params}
 
@@ -321,7 +325,7 @@ class MedianFoldPruner:
 
 
 # ============================================================================
-# Fast Preprocessed Window & MISO Regressor Cache
+# Fast Preprocessed Window & 4-Channel MISO Regressor Cache
 # ============================================================================
 def preprocess_dataset_windows(
     X: np.ndarray,
@@ -329,62 +333,54 @@ def preprocess_dataset_windows(
     hi: float = 4.0,
     fs: float = FS,
     max_M: int = MAX_M,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Preprocess each 5D window `(5, N)` and prebuild its maximal delay tensor `U_max`.
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Preprocess each 5D window `(5, N)` into 6 normalized channels and prebuild `U_max`.
 
-    Since column `i` of axis `k` in `build_U(acc, M)` is simply `acc[k]` delayed by `i`
-    samples (independent of `M`), precomputing `U_max` of shape `(N, 3, max_M)` once per
-    window allows any `U` of order `M <= max_M` to be extracted instantaneously via
-    `U_max[:, :, :M].reshape(N, 3 * M)` without rebuilding the delay matrix in every trial.
-
-    Parameters
-    ----------
-    X : np.ndarray
-        Dataset of individual windows with shape `(n_windows, 5, N)`.
-    lo, hi : float, default=(0.5, 4.0)
-        Bandpass cutoff frequencies in Hz (30-240 BPM).
-    fs : float, default=125
-        Sampling frequency in Hz.
-    max_M : int, default=48
-        Maximum filter tap order `M` in the search space.
+    Uses `prepare_channels` to compute the 4th accelerometer magnitude channel `acc_mag`,
+    apply 3rd-order zero-phase Butterworth bandpass filtering (`0.5 - 4.0` Hz), and
+    normalize to unit variance. Precomputes `U_max` of shape `(N, 4, max_M)` once per
+    window so any `U` of order `M <= max_M` can be extracted instantaneously via
+    `U_max[:, :, :M].reshape(N, 4 * M)`.
 
     Returns
     -------
-    list[tuple[np.ndarray, np.ndarray, np.ndarray]]
-        List of `(ppg1, ppg2, U_max_3d)` tuples, one per window, where `U_max_3d`
-        has shape `(N, 3, max_M)`.
+    list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
+        List of `(ppg1, ppg2, acc_norm, U_max_3d)` tuples, one per window, where
+        `acc_norm` has shape `(4, N)` and `U_max_3d` has shape `(N, 4, max_M)`.
     """
     cached = []
     for w in X:
-        ppg1, ppg2, acc = preprocess_signal(w, lo=lo, hi=hi, fs=fs)
+        ppg_norm, acc_norm = prepare_channels(w, fs=fs, lo=lo, hi=hi, order=3, causal=False)
+        ppg1, ppg2 = ppg_norm[0], ppg_norm[1]
         N = len(ppg1)
-        U_full = build_U(acc, max_M).reshape(N, 3, max_M)
-        cached.append((ppg1, ppg2, U_full))
+        U_full = build_U(acc_norm, max_M).reshape(N, 4, max_M)
+        cached.append((ppg1, ppg2, acc_norm, U_full))
     return cached
 
 
 def _filter_cached_window(
     ppg1: np.ndarray,
     ppg2: np.ndarray,
+    acc_norm: np.ndarray,
     U_max_3d: np.ndarray,
     lms_algo: str,
     M: int,
     lms_params: dict,
 ) -> np.ndarray:
-    """Run parallel MISO LMS filtering + SNR-weighted Late Fusion using a sliced `U` view."""
+    """Run single-pass parallel 4M-tap MISO LMS + motion-suppressed Late Fusion."""
     N = len(ppg1)
-    U = U_max_3d[:, :, :M].reshape(N, 3 * M)
+    U = U_max_3d[:, :, :M].reshape(N, 4 * M)
     lms_fn = LMS_REGISTRY[lms_algo]
     e1, _, _ = lms_fn(ppg1, U, M=M, **lms_params)
     e2, _, _ = lms_fn(ppg2, U, M=M, **lms_params)
-    return snr_weighted_late_fusion(e1, e2, return_weights=False)
+    return snr_weighted_late_fusion(e1, e2, acc=acc_norm, return_weights=False)
 
 
 # ============================================================================
-# Phase 1: Decoupled Fast Screening via Spectral SNR Proxy
+# Phase 1: Decoupled Fast Screening via Motion-Suppressed Spectral SNR Proxy
 # ============================================================================
 def run_phase1_snr_screening(
-    preprocessed_windows: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    preprocessed_windows: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
     screening_indices: np.ndarray,
     n_trials: int = 25,
     top_k: int = 6,
@@ -392,14 +388,9 @@ def run_phase1_snr_screening(
 ) -> tuple[list[dict], list[dict]]:
     """Phase 1: Decoupled Fast Screening of LMS hyperparameters using the Spectral SNR Proxy.
 
-    Evaluates candidate LMS configurations (`standard_lms`, `nlms`, `vs_lms` and their
-    conditioned sub-parameters) on a screening subset of individual windows by maximizing
-    the average in-band cardiac Spectral SNR (`estimate_cardiac_snr`) of the Late-Fused
-    signal `e_fused[n]`.
-
-    Guarantees that the best discovered configuration of each of the 3 LMS families
-    (`standard_lms`, `nlms`, `vs_lms`) is included in `top_lms_configs` so all families
-    are represented in Phase 2.
+    Evaluates candidate single-pass LMS configurations (`standard_lms`, `nlms`, `vs_lms`)
+    on a screening subset of individual windows by maximizing the motion-suppressed
+    in-band cardiac Spectral SNR (`estimate_cardiac_snr(e_fused, acc=acc_norm)`).
     """
     lms_families = CONDITIONAL_SEARCH_SPACE["lms_algorithm"]
     tpe = ConditionalTPE(
@@ -410,7 +401,6 @@ def run_phase1_snr_screening(
     phase1_history = []
 
     for trial_idx in range(n_trials):
-        # Cycle through all 3 LMS families during initial startup trials
         forced_algo = lms_families[trial_idx % len(lms_families)] if trial_idx < 9 else None
         candidate = tpe.sample_lms_node(forced_lms_algo=forced_algo)
         lms_algo = candidate["lms_algorithm"]
@@ -420,12 +410,14 @@ def run_phase1_snr_screening(
         snr_scores = []
         diverged = False
         for idx in screening_indices:
-            ppg1, ppg2, U_max_3d = preprocessed_windows[int(idx)]
-            e_fused = _filter_cached_window(ppg1, ppg2, U_max_3d, lms_algo, M, lms_params)
+            ppg1, ppg2, acc_norm, U_max_3d = preprocessed_windows[int(idx)]
+            e_fused = _filter_cached_window(
+                ppg1, ppg2, acc_norm, U_max_3d, lms_algo, M, lms_params
+            )
             if not np.all(np.isfinite(e_fused)):
                 diverged = True
                 break
-            snr_scores.append(estimate_cardiac_snr(e_fused))
+            snr_scores.append(estimate_cardiac_snr(e_fused, acc=acc_norm))
 
         mean_snr = 0.0 if (diverged or not snr_scores) else float(np.mean(snr_scores))
         loss = -mean_snr if mean_snr > 0.0 else 1e6
@@ -442,7 +434,7 @@ def run_phase1_snr_screening(
 
     sorted_trials = sorted(phase1_history, key=lambda r: r["mean_snr"], reverse=True)
 
-    # First pick the best configuration from each of the 3 LMS families
+    # Retain the best configuration from each of the 3 LMS families first
     top_lms_configs: list[dict] = []
     used_trials: set[int] = set()
     for fam in lms_families:
@@ -457,7 +449,6 @@ def run_phase1_snr_screening(
                 used_trials.add(t["trial"])
                 break
 
-    # Fill remaining slots up to top_k with the highest overall SNR trials
     for t in sorted_trials:
         if len(top_lms_configs) >= top_k:
             break
@@ -477,7 +468,7 @@ def run_phase1_snr_screening(
 # Phase 2: End-to-End TPE Optimization with Subject-Wise Group K-Fold & Pruning
 # ============================================================================
 def run_phase2_tpe_optimization(
-    preprocessed_windows: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    preprocessed_windows: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
     y: np.ndarray,
     splits: list[tuple[np.ndarray, np.ndarray]],
     seed_lms_configs: list[dict],
@@ -488,22 +479,26 @@ def run_phase2_tpe_optimization(
     """Phase 2: End-to-End Joint TPE Optimization with Early Pruning across Group K-Folds.
 
     Jointly optimizes the full conditional hyperparameter tree (`lms_algorithm` + sub-parameters
-    and `hr_algorithm` + sub-parameters) by minimizing the outlier-penalized window-wise
-    BPM error (`objective_function`) across Subject-Wise Group K-Fold splits.
+    and `hr_algorithm` + sub-parameters, including `suppression_alpha` and `harmonic_weight`)
+    by minimizing `objective_function` across Subject-Wise Group K-Fold splits.
     """
     tpe = ConditionalTPE(
         seed=seed + 100,
         gamma_quantile=0.25,
         n_startup_trials=max(6, len(seed_lms_configs)),
     )
-    # 6 warmup trials ensure the first 6 combinations (3 LMS x 2 HR) run all folds unpruned
     pruner = MedianFoldPruner(n_warmup_trials=6, percentile=prune_percentile)
 
     warm_start_queue: list[dict] = []
     for lms_cfg in seed_lms_configs:
         for hr_algo in CONDITIONAL_SEARCH_SPACE["hr_algorithm"]:
             hr_default = (
-                {"nfft": 8192, "window_type": "hann"}
+                {
+                    "nfft": 16384,
+                    "window_type": "hamming",
+                    "suppression_alpha": 0.6,
+                    "harmonic_weight": 0.35,
+                }
                 if hr_algo == "periodogram"
                 else {"w1_sec": 0.111, "w2_sec": 0.667, "beta_offset": 0.02}
             )
@@ -541,11 +536,14 @@ def run_phase2_tpe_optimization(
             val_targets = y[val_indices]
 
             for w_idx in val_indices:
-                ppg1, ppg2, U_max_3d = preprocessed_windows[int(w_idx)]
-                e_fused = _filter_cached_window(ppg1, ppg2, U_max_3d, lms_algo, M, lms_params)
+                ppg1, ppg2, acc_norm, U_max_3d = preprocessed_windows[int(w_idx)]
+                e_fused = _filter_cached_window(
+                    ppg1, ppg2, acc_norm, U_max_3d, lms_algo, M, lms_params
+                )
                 bpm_hat = estimate_bpm_window(
                     e_fused,
                     hr_algorithm=hr_algo,
+                    acc_norm=acc_norm,
                     **hr_params,
                 )
                 val_preds.append(bpm_hat)
@@ -612,7 +610,10 @@ def summarize_algorithm_comparisons(
         if (
             pair_key not in best_phase2_by_pair
             or (not entry["pruned"] and best_phase2_by_pair[pair_key]["pruned"])
-            or (entry["pruned"] == best_phase2_by_pair[pair_key]["pruned"] and obj < best_phase2_by_pair[pair_key]["score_objective"])
+            or (
+                entry["pruned"] == best_phase2_by_pair[pair_key]["pruned"]
+                and obj < best_phase2_by_pair[pair_key]["score_objective"]
+            )
         ):
             best_phase2_by_pair[pair_key] = entry
 

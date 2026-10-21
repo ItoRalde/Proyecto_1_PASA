@@ -1,16 +1,17 @@
 """
 Heart rate (BPM) estimation module for individual signal windows of length N.
 
-Implements two heart rate estimation algorithms and a selector bucket function:
-1. Zero-Padded Periodogram (`zero_padded_periodogram_bpm`):
-   Tapers the N-sample window, explicitly zero-pads to `nfft` samples (`nfft >= N`),
-   computes the power spectral density (periodogram), and locates the dominant
-   cardiac frequency peak in [0.5 Hz, 4.0 Hz] (30 - 240 BPM).
-2. Systolic Peak Detection via Elgendi's Algorithm (`elgendi_systolic_peak_bpm`):
-   Uses two moving averages (`MA_peak` over systolic duration `W1` and `MA_beat`
-   over heartbeat duration `W2`) on the squared positive signal with a dynamic
-   offset threshold `alpha = beta_offset * mean(y^2)` to isolate systolic blocks
-   of interest, extract systolic peaks, and compute BPM from inter-beat intervals.
+Implements:
+1. Motion-Suppressed Harmonic Periodogram (`motion_suppressed_periodogram_bpm`):
+   - Computes the normalized zero-padded PSD of `e_fused` in [0.5, 4.0] Hz.
+   - Computes the mean normalized PSD of the 4 accelerometer channels `acc_norm` in [0.5, 4.0] Hz.
+   - Applies soft spectral subtraction:
+         clean_score(f) = psd_e_band(f) * maximum(0.05, 1.0 - suppression_alpha * psd_acc_mean(f))
+   - Reinforces cardiac fundamentals supported by a 2nd harmonic at 2f:
+         score(f) = clean_score(f) * (1.0 + harmonic_weight * psd_e_norm(2f))
+   - Returns `60.0 * freqs_band[argmax(score)]`.
+2. Standard Zero-Padded Periodogram (`zero_padded_periodogram_bpm`).
+3. Systolic Peak Detection via Elgendi's Algorithm (`elgendi_systolic_peak_bpm`).
 """
 
 import numpy as np
@@ -32,73 +33,150 @@ def _get_taper_window(window_type: str, N: int) -> np.ndarray:
     raise ValueError(f"Unsupported window_type '{window_type}'.")
 
 
-def zero_padded_periodogram_bpm(
-    x: np.ndarray,
+def motion_suppressed_periodogram_bpm(
+    e_fused: np.ndarray,
+    acc_norm: np.ndarray | None = None,
     fs: float = FS,
-    nfft: int = 8192,
+    nfft: int = 16384,
     lo: float = 0.5,
     hi: float = 4.0,
-    window_type: str = "hann",
-) -> float:
-    """Estimate heart rate (BPM) on a window of length N via Zero-Padded Periodogram.
+    window_type: str = "hamming",
+    suppression_alpha: float = 0.6,
+    harmonic_weight: float = 0.35,
+    return_spectrum: bool = False,
+) -> float | tuple[float, dict]:
+    """Estimate BPM using the Motion-Suppressed Harmonic Zero-Padded Periodogram.
 
     Steps:
-    1. Zero-center the N-sample cardiac signal `x[n]` and multiply by a taper window
-       `w[n]` (`hann`, `hamming`, `blackman`, or `boxcar`) to suppress spectral leakage.
-    2. Explicitly zero-pad the tapered signal of length `N` with `nfft - N` zeros to
-       length `nfft` (`nfft >= N`), interpolating the discrete Fourier spectrum.
-    3. Compute the Periodogram power spectral density:
-           P(f_k) = (1 / (fs * sum(w[n]^2))) * |RFFT(x_padded)[k]|^2
-    4. Find the frequency `f_max` maximizing `P(f)` within the physiological cardiac
-       band `[lo, hi]` Hz (`[0.5, 4.0]` Hz = `30 - 240` BPM) and return `60 * f_max`.
+    1. Computes the normalized zero-padded PSD of `e_fused` in `[lo, hi]` Hz (`[0.5, 4.0]` Hz).
+    2. Computes the mean normalized PSD of the 4 accelerometer channels `acc_norm`
+       in `[lo, hi]` Hz.
+    3. Applies soft spectral subtraction to penalize residual motion artifact peaks:
+           clean_score(f) = psd_e_band(f) * maximum(0.05, 1.0 - suppression_alpha * psd_acc_mean(f))
+    4. Reinforces candidate fundamentals `f` that exhibit a 2nd cardiac harmonic at `2f`:
+           score(f) = clean_score(f) * (1.0 + harmonic_weight * psd_e_norm(2f))
+    5. Returns `60.0 * freqs_band[argmax(score)]`.
 
     Parameters
     ----------
-    x : np.ndarray
-        1D reconstructed cardiac signal of length `N` (e.g., `N = 1000` samples = 8 s).
+    e_fused : np.ndarray
+        1D reconstructed cardiac signal of length `N` (`1000` samples = 8 s).
+    acc_norm : np.ndarray, optional
+        Normalized 4-channel accelerometer reference `[accx, accy, accz, acc_mag]`
+        of shape `(4, N)`. If None, skips accelerometer spectral subtraction (`psd_acc_mean = 0`).
     fs : float, default=125
         Sampling frequency in Hz.
-    nfft : int, default=8192
-        Total length after zero-padding (`nfft >= len(x)`).
+    nfft : int, default=16384
+        Zero-padded FFT length (`nfft >= N`).
     lo : float, default=0.5
         Lower frequency bound of the cardiac band in Hz (30 BPM).
     hi : float, default=4.0
         Upper frequency bound of the cardiac band in Hz (240 BPM).
-    window_type : {'hann', 'hamming', 'blackman', 'boxcar'}, default='hann'
+    window_type : {'hamming', 'hann', 'blackman', 'boxcar'}, default='hamming'
         Spectral taper window applied before zero-padding.
+    suppression_alpha : float, default=0.6
+        Soft spectral subtraction weight in `[0.2, 0.85]`.
+    harmonic_weight : float, default=0.35
+        Second-harmonic reinforcement weight in `[0.1, 0.6]`.
+    return_spectrum : bool, default=False
+        If True, returns `(bpm_est, spectrum_dict)` for visualization.
 
     Returns
     -------
-    float
-        Estimated heart rate in Beats Per Minute (BPM). Returns `np.nan` if the
-        input window contains NaNs (e.g., due to LMS filter divergence).
+    bpm_est : float
+        Estimated heart rate in BPM (`np.nan` if input is invalid).
+    spectrum_dict : dict, optional
+        Returned when `return_spectrum=True`.
     """
-    x = np.asarray(x, dtype=float)
+    x = np.asarray(e_fused, dtype=float)
     N = len(x)
     if N == 0 or not np.all(np.isfinite(x)):
-        return float("nan")
+        return (float("nan"), {}) if return_spectrum else float("nan")
 
-    # 1. Zero-center and apply taper window of length N
+    eps = 1e-12
     taper = _get_taper_window(window_type, N)
     x_tapered = (x - np.mean(x)) * taper
 
-    # 2. Explicit zero-padding from length N to length nfft
     pad_len = max(0, int(nfft) - N)
     x_padded = np.pad(x_tapered, (0, pad_len), mode="constant", constant_values=0.0)
     total_nfft = len(x_padded)
 
-    # 3. Compute Periodogram P(f)
-    window_energy = float(np.sum(taper**2))
-    scale = (fs * window_energy) if window_energy > 0 else 1.0
-    periodogram = (np.abs(np.fft.rfft(x_padded, n=total_nfft)) ** 2) / scale
+    psd_e = np.abs(np.fft.rfft(x_padded, n=total_nfft)) ** 2
     freqs = np.fft.rfftfreq(total_nfft, d=1.0 / fs)
 
-    # 4. Peak search restricted to the cardiac band [lo, hi] Hz
-    mask = (freqs >= lo) & (freqs <= hi)
-    if not np.any(mask):
-        return float("nan")
+    band_mask = (freqs >= lo) & (freqs <= hi)
+    if not np.any(band_mask):
+        return (float("nan"), {}) if return_spectrum else float("nan")
 
-    return float(60.0 * freqs[mask][np.argmax(periodogram[mask])])
+    freqs_band = freqs[band_mask]
+    band_max_e = float(np.max(psd_e[band_mask])) + eps
+    psd_e_norm = psd_e / band_max_e
+    psd_e_band = psd_e_norm[band_mask]
+
+    # Mean normalized PSD of the 4 accelerometer reference channels in [lo, hi] Hz
+    if acc_norm is not None:
+        acc_arr = np.asarray(acc_norm, dtype=float)
+        if acc_arr.ndim == 1:
+            acc_arr = acc_arr[np.newaxis, :]
+        acc_tapered = (acc_arr - np.mean(acc_arr, axis=-1, keepdims=True)) * taper[np.newaxis, :]
+        acc_padded = np.pad(acc_tapered, ((0, 0), (0, pad_len)), mode="constant", constant_values=0.0)
+        psd_acc = np.abs(np.fft.rfft(acc_padded, n=total_nfft, axis=-1)) ** 2
+        acc_band_max = np.max(psd_acc[:, band_mask], axis=-1, keepdims=True) + eps
+        psd_acc_band_norm = psd_acc[:, band_mask] / acc_band_max
+        psd_acc_mean = np.mean(psd_acc_band_norm, axis=0)
+    else:
+        psd_acc_mean = np.zeros_like(psd_e_band)
+
+    # Step 3: Soft spectral subtraction of motion peaks
+    clean_score = psd_e_band * np.maximum(0.05, 1.0 - suppression_alpha * psd_acc_mean)
+
+    # Step 4: Reinforce frequencies supported by a 2nd harmonic at 2*f
+    psd_e_2f = np.interp(2.0 * freqs_band, freqs, psd_e_norm, left=0.0, right=0.0)
+    score = clean_score * (1.0 + harmonic_weight * psd_e_2f)
+
+    bpm_est = float(60.0 * freqs_band[int(np.argmax(score))])
+
+    if return_spectrum:
+        return bpm_est, {
+            "freqs_bpm": 60.0 * freqs_band,
+            "psd_e_band": psd_e_band,
+            "psd_acc_mean": psd_acc_mean,
+            "clean_score": clean_score,
+            "score": score / (float(np.max(score)) + eps),
+        }
+    return bpm_est
+
+
+def zero_padded_periodogram_bpm(
+    x: np.ndarray,
+    acc_norm: np.ndarray | None = None,
+    fs: float = FS,
+    nfft: int = 16384,
+    lo: float = 0.5,
+    hi: float = 4.0,
+    window_type: str = "hamming",
+    suppression_alpha: float = 0.6,
+    harmonic_weight: float = 0.35,
+) -> float:
+    """Estimate heart rate (BPM) on a window of length N via Zero-Padded Periodogram.
+
+    When `acc_norm` is provided, delegates to `motion_suppressed_periodogram_bpm`
+    with soft accelerometer spectral subtraction (`suppression_alpha`) and second-harmonic
+    reinforcement (`harmonic_weight`). When `acc_norm` is None, still applies the
+    zero-padded periodogram with harmonic reinforcement (`suppression_alpha` has no effect).
+    """
+    return motion_suppressed_periodogram_bpm(
+        e_fused=x,
+        acc_norm=acc_norm,
+        fs=fs,
+        nfft=nfft,
+        lo=lo,
+        hi=hi,
+        window_type=window_type,
+        suppression_alpha=suppression_alpha,
+        harmonic_weight=harmonic_weight,
+        return_spectrum=False,
+    )
 
 
 # Alias preserving compatibility with original repository function name
@@ -119,6 +197,7 @@ def _moving_average(sig: np.ndarray, win_samples: int) -> np.ndarray:
 
 def elgendi_systolic_peak_bpm(
     x: np.ndarray,
+    acc_norm: np.ndarray | None = None,
     fs: float = FS,
     w1_sec: float = 0.111,
     w2_sec: float = 0.667,
@@ -128,44 +207,13 @@ def elgendi_systolic_peak_bpm(
     """Estimate heart rate (BPM) on a window of length N using Elgendi's Systolic Peak Detection.
 
     Implements Elgendi et al.'s (2013) two-event-related moving-average algorithm:
-    1. Signal Squaring:
-       Zero-center `x[n]`, clip negative values (`y[n] = max(x[n], 0)`), and square
-       (`S[n] = y[n]^2`) to emphasize systolic peaks and suppress diastolic waves/noise.
-    2. Two Moving Averages:
-       - `MA_peak[n]`: Moving average over window `W1 = int(round(w1_sec * fs))`
-         representing the typical duration of a single systolic peak (~111 ms).
-       - `MA_beat[n]`: Moving average over window `W2 = int(round(w2_sec * fs))`
-         representing the typical duration of a full heartbeat cycle (~667 ms).
-    3. Dynamic Thresholding:
-       `THR1[n] = MA_beat[n] + beta_offset * mean(S[n])`
-    4. Systolic Block Formation & Peak Extraction:
-       Contiguous intervals where `MA_peak[n] > THR1[n]` and width `>= W1` are marked
-       as systolic blocks of interest. The local maximum of `x[n]` inside each valid
-       block is extracted as a systolic peak, enforcing a minimum refractory distance
-       `min_distance_sec` (0.25 s -> max 240 BPM) between peaks.
-    5. BPM Calculation:
-       Computes inter-beat intervals `IBI = diff(peaks) / fs`, keeps physiologically
-       valid intervals in `[0.25 s, 2.0 s]` (30 - 240 BPM), and returns `60 / median(IBI)`.
-
-    Parameters
-    ----------
-    x : np.ndarray
-        1D reconstructed cardiac signal window of length `N`.
-    fs : float, default=125
-        Sampling frequency in Hz.
-    w1_sec : float, default=0.111
-        Systolic peak moving-average window duration in seconds (typical range: 0.08 - 0.16 s).
-    w2_sec : float, default=0.667
-        Heartbeat moving-average window duration in seconds (typical range: 0.55 - 0.85 s).
-    beta_offset : float, default=0.02
-        Offset multiplier `beta` added to `MA_beat` via `beta_offset * mean(S)`.
-    min_distance_sec : float, default=0.25
-        Minimum physiological time separation in seconds between consecutive systolic peaks.
-
-    Returns
-    -------
-    float
-        Estimated heart rate in BPM. Returns `np.nan` if input contains NaNs.
+    1. Half-wave rectification and squaring: `S[n] = max(x[n] - mean(x), 0)^2`.
+    2. Two moving averages: `MA_peak` over `W1` (~111 ms) and `MA_beat` over `W2` (~667 ms).
+    3. Dynamic thresholding: `THR1[n] = MA_beat[n] + beta_offset * mean(S)`.
+    4. Systolic peak extraction within blocks of width `>= W1`, enforcing minimum refractory
+       separation `min_distance_sec` (0.25 s).
+    5. BPM calculation from the median inter-beat interval (with fallback to
+       `motion_suppressed_periodogram_bpm` if `< 2` valid peaks are detected).
     """
     x = np.asarray(x, dtype=float)
     N = len(x)
@@ -176,20 +224,16 @@ def elgendi_systolic_peak_bpm(
     if np.std(x_centered) < 1e-12:
         return float("nan")
 
-    # 1. Half-wave rectification and squaring
     y_pos = np.maximum(x_centered, 0.0)
     S = y_pos**2
 
-    # 2. Compute MA_peak (W1) and MA_beat (W2)
     W1 = max(3, int(round(w1_sec * fs)))
     W2 = max(W1 + 2, int(round(w2_sec * fs)))
     ma_peak = _moving_average(S, W1)
     ma_beat = _moving_average(S, W2)
 
-    # 3. Dynamic threshold THR1
     thr1 = ma_beat + beta_offset * float(np.mean(S))
 
-    # 4. Identify contiguous blocks of interest where MA_peak > THR1
     above = ma_peak > thr1
     padded_above = np.concatenate([[False], above, [False]])
     transitions = np.diff(padded_above.astype(int))
@@ -202,33 +246,30 @@ def elgendi_systolic_peak_bpm(
             local_idx = start + int(np.argmax(x_centered[start:end]))
             candidate_peaks.append(local_idx)
 
-    # Enforce minimum refractory distance between consecutive systolic peaks
     min_dist_samples = max(1, int(round(min_distance_sec * fs)))
     peaks = []
     for p in candidate_peaks:
         if not peaks or (p - peaks[-1]) >= min_dist_samples:
             peaks.append(p)
         elif x_centered[p] > x_centered[peaks[-1]]:
-            # Keep the higher-amplitude peak if two candidates fall within refractory period
             peaks[-1] = p
 
-    # 5. Convert inter-beat intervals (IBIs) to BPM
     if len(peaks) >= 2:
         ibis = np.diff(peaks) / float(fs)
         valid_ibis = ibis[(ibis >= 0.25) & (ibis <= 2.0)]
         if len(valid_ibis) >= 1:
             return float(60.0 / np.median(valid_ibis))
 
-    # Graceful fallback to zero-padded periodogram if noisy window yields < 2 valid peaks
-    return zero_padded_periodogram_bpm(x, fs=fs)
+    return motion_suppressed_periodogram_bpm(x, acc_norm=acc_norm, fs=fs)
 
 
 # ============================================================================
 # Heart Rate Estimation Bucket Function & Objective Function
 # ============================================================================
 HR_REGISTRY: dict[str, callable] = {
-    "periodogram": zero_padded_periodogram_bpm,
-    "zero_padded_periodogram": zero_padded_periodogram_bpm,
+    "periodogram": motion_suppressed_periodogram_bpm,
+    "zero_padded_periodogram": motion_suppressed_periodogram_bpm,
+    "motion_suppressed_periodogram": motion_suppressed_periodogram_bpm,
     "elgendi": elgendi_systolic_peak_bpm,
     "systolic_peak": elgendi_systolic_peak_bpm,
 }
@@ -237,6 +278,7 @@ HR_REGISTRY: dict[str, callable] = {
 def estimate_bpm_window(
     e_window: np.ndarray,
     hr_algorithm: str = "periodogram",
+    acc_norm: np.ndarray | None = None,
     fs: float = FS,
     **hr_params,
 ) -> float:
@@ -246,13 +288,16 @@ def estimate_bpm_window(
     ----------
     e_window : np.ndarray
         1D reconstructed cardiac signal for a single window of length `N`.
-    hr_algorithm : {'periodogram', 'zero_padded_periodogram', 'elgendi', 'systolic_peak'}
+    hr_algorithm : {'periodogram', 'motion_suppressed_periodogram', 'elgendi'}
         Selected heart rate estimation algorithm.
+    acc_norm : np.ndarray, optional
+        Normalized 4-channel accelerometer reference `[accx, accy, accz, acc_mag]`
+        of shape `(4, N)` for motion-suppressed periodogram estimation.
     fs : float, default=125
         Sampling frequency in Hz.
     **hr_params
         Conditioned sub-parameters for the chosen HR estimator:
-        - For `'periodogram'`: `nfft`, `window_type`, `lo`, `hi`
+        - For `'periodogram'`: `nfft`, `window_type`, `suppression_alpha`, `harmonic_weight`
         - For `'elgendi'`: `w1_sec`, `w2_sec`, `beta_offset`, `min_distance_sec`
 
     Returns
@@ -264,7 +309,7 @@ def estimate_bpm_window(
     if key not in HR_REGISTRY:
         valid = ", ".join(sorted(HR_REGISTRY.keys()))
         raise ValueError(f"Unknown hr_algorithm '{hr_algorithm}'. Valid options: {valid}")
-    return HR_REGISTRY[key](e_window, fs=fs, **hr_params)
+    return HR_REGISTRY[key](e_window, acc_norm=acc_norm, fs=fs, **hr_params)
 
 
 def objective_function(
@@ -289,8 +334,10 @@ def objective_function(
     abs_err = np.abs(est - true)
     aae = float(np.mean(abs_err))
     rmse = float(np.sqrt(np.mean(abs_err ** 2)))
-    
+
     # Soft hinge penalty for catastrophic tracking failures (> 10 BPM error)
     excess_outlier_err = float(np.mean(np.maximum(0.0, abs_err - outlier_threshold)))
+
+    return aae + (rmse_weight * rmse) + (outlier_weight * excess_outlier_err)
 
     return aae + (rmse_weight * rmse) + (outlier_weight * excess_outlier_err)

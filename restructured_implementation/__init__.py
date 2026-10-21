@@ -1,5 +1,5 @@
 """
-Restructured implementation of the Dual-PPG + Triaxial Accelerometer
+Restructured implementation of the Dual-PPG + 4-Channel Accelerometer
 Heart Signal Reconstruction and Joint TPE Hyperparameter Optimization Pipeline.
 """
 
@@ -16,6 +16,7 @@ from .dataset_preparation import (
 from .preprocessing import (
     bandpass,
     normalize_amplitude,
+    prepare_channels,
     preprocess_signal,
 )
 from .reference_construction import (
@@ -33,6 +34,7 @@ from .fusion import (
     snr_weighted_late_fusion,
 )
 from .bpm_detection import (
+    motion_suppressed_periodogram_bpm,
     zero_padded_periodogram_bpm,
     bpm_from_window,
     elgendi_systolic_peak_bpm,
@@ -45,6 +47,7 @@ from .pipeline import (
     HeartRateEstimatorModel,
 )
 from .optimization import (
+    MAX_M,
     CONDITIONAL_SEARCH_SPACE,
     ConditionalTPE,
     MedianFoldPruner,
@@ -66,6 +69,7 @@ __all__ = [
     "subject_wise_group_kfold",
     "bandpass",
     "normalize_amplitude",
+    "prepare_channels",
     "preprocess_signal",
     "build_U",
     "standard_lms",
@@ -75,6 +79,7 @@ __all__ = [
     "estimate_cardiac_snr",
     "compute_snr_weights",
     "snr_weighted_late_fusion",
+    "motion_suppressed_periodogram_bpm",
     "zero_padded_periodogram_bpm",
     "bpm_from_window",
     "elgendi_systolic_peak_bpm",
@@ -83,11 +88,13 @@ __all__ = [
     "reconstruct_heart_signal",
     "predict_window_bpm",
     "HeartRateEstimatorModel",
+    "MAX_M",
     "CONDITIONAL_SEARCH_SPACE",
     "ConditionalTPE",
     "MedianFoldPruner",
     "preprocess_dataset_windows",
     "run_phase1_snr_screening",
     "run_phase2_tpe_optimization",
+    "summarize_algorithm_comparisons",
     "optimize_hr_pipeline",
 ]
