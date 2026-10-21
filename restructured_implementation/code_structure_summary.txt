@@ -23,6 +23,7 @@ restructured_implementation/
 ├── bpm_detection.py             # Zero-Padded Periodogram, Elgendi Systolic Peak, Objective Function
 ├── pipeline.py                  # Window-level signal reconstruction & HeartRateEstimatorModel
 ├── optimization.py              # 2-Phase Conditional TPE Optimization with Early Fold Pruning
+├── pipeline_optimization_and_evaluation.ipynb # Notebook: pipeline docs, TPE optimization & test evaluation
 ├── code_structure_summary.txt   # This architecture and module reference summary
 └── tests_on_dataset/
     └── participant_split.py     # Dataset ordering and participant boundary verification script
