@@ -1,313 +1,366 @@
+"""
+Adaptive MISO LMS filtering algorithms and Late Fusion bucket function.
+
+Implements the adaptive filtering stage of the PPG heart signal reconstruction pipeline:
+- Primary input `d[n]`: Preprocessed PPG channel (`s[n] + m[n]`, cardiac signal + motion artifact).
+- Reference input `a[n]`: Triaxial accelerometer tapped-delay vector `[a_1^T[n], a_2^T[n], a_3^T[n]]^T`.
+- MISO motion artifact estimate:
+      m_hat[n] = sum_{k=1}^3 w_k^T[n] a_k[n] = w^T[n] a[n]
+- Cleared cardiac signal (error output):
+      e[n] = d[n] - m_hat[n] = s[n] + m[n] - w^T[n] a[n]
+
+Included LMS Variants:
+1. Standard LMS (`standard_lms`):
+   Hyperparameters: `mu` (or `my`), `M`.
+2. Normalized LMS (`nlms`):
+   Hyperparameters: `mu` (or `my`), `M`, `delta`.
+3. Variable Step-Size LMS (`vs_lms`, Kwong & Johnston, 1992):
+   Hyperparameters: `M`, `mu_max`, `mu_min`, `alpha`, `gamma`.
+
+Bucket Function (`lms_bucket`):
+   Selects the desired LMS variant and its hyperparameters, filters `ppg1` and `ppg2`
+   in parallel against the 3-axis accelerometer reference `acc`, and fuses the two
+   cleaned cardiac outputs via SNR-Weighted Late Fusion.
+"""
+
 import numpy as np
 
-# toma todas las señales de accelerometro y las combina, añadiendo zeros para q sea pueda utilizar después
+from .reference_construction import build_U
+from .fusion import snr_weighted_late_fusion
 
-def build_U(acc, M):
-    """Fila n = [ejex(n), ejex(n-1), ..., ejex(n-M+1), ejey(n), ..., ejez(n-M+1)] (ceros antes de n=0)."""
-    n_ref, N = acc.shape
-    U = np.zeros((N, n_ref * M))
-    for k in range(n_ref):
-        padded = np.concatenate([np.zeros(M - 1), acc[k]])
-        for i in range(M):
-            U[:, k * M + i] = padded[M - 1 - i : M - 1 - i + N]
-    return U
-
-# construiendo una función de LMS para poder aplicar después
+# Divergence threshold to detect numerical instability during adaptation
+DIV_THR: float = 1e3
 
 
-def LMS(ppg1, ppg2, accx, accy, accz, M):
-    # combinando las dos señales de PPG y normalizandolas
-    d = (ppg1 + ppg2) / 2
-    d = (d - d.mean()) / d.std()
-
-    #combinando las señales del acelerómetro y normalizandolas
-    acc = np.vstack([accx, accy, accz])
-    acc = (acc - acc.mean(axis=1, keepdims=True)) / acc.std(axis=1, keepdims=True)
-    
-    # algoritmo LMS
-
-    U = build_U(acc, M)
-    w = np.zeros(U.shape[1])
-    e = np.zeros(len(d))
-    y = np.zeros(len(d))
-
-    # calculando el máximo mu possible
-    trR = np.mean(np.sum(U**2, axis=1))
-    mu_max = 2 / (3 * trR) # usando un factor de 2/3 para asegurar estabilidad, pero para afinar el numero se tiene q hacer montecarlos
-    mu = mu_max 
-    
-    for n in range(len(d)):
-        # calculando la salida del filtro
-        y[n] = w @ U[n]
-        
-        # calculando el error
-        e[n] = d[n] - y[n]
-        
-        # actualizando los pesos
-        w = w + mu * e[n] * U[n]
-    
-    return e, y, w
-
-# construiendo una función de newton LMS para poder aplicar después
+def _prepare_regressor(acc_or_U: np.ndarray, N: int, M: int) -> np.ndarray:
+    """Return the (N, 3 * M) regressor matrix U from either raw `acc` (3, N) or prebuilt `U`."""
+    arr = np.asarray(acc_or_U, dtype=float)
+    if arr.ndim == 2 and arr.shape[0] == N and arr.shape[1] != N:
+        return arr
+    return build_U(arr, M)
 
 
-
-def Newton_LMS(ppg1, ppg2, accx, accy, accz, M):
-    # combinando las dos señales de PPG y normalizandolas
-    d = (ppg1 + ppg2) / 2
-    d = (d - d.mean()) / d.std()
-
-    #combinando las señales del acelerómetro y normalizandolas
-    acc = np.vstack([accx, accy, accz])
-    acc = (acc - acc.mean(axis=1, keepdims=True)) / acc.std(axis=1, keepdims=True)
-    
-    # algoritmo LMS
-
-    U = build_U(acc, M)
-    w = np.zeros(U.shape[1])
-    e = np.zeros(len(d))
-    y = np.zeros(len(d))
-
-    # calculando el máximo mu possible
-    trR = np.mean(np.sum(U**2, axis=1))
-    mu_max = 2 / (3 * trR) # usando un factor de 2/3 para asegurar estabilidad, pero para afinar el numero se tiene q hacer montecarlos
-    mu = mu_max 
-
-    # calculando la matriz de correlación R y su inversa
-    R = np.cov(U, rowvar=False)
-    R_inv = np.linalg.inv(R)
-    
-    for n in range(len(d)):
-        # calculando la salida del filtro
-        y[n] = w @ U[n]
-        
-        # calculando el error
-        e[n] = d[n] - y[n]
-        
-        # actualizando los pesos (utilizando la inversa de la matriz de correlación para el método de Newton)
-        w = w + mu * R_inv @ (e[n] * U[n])
-    
-    return e, y, 
-
-#gemini implemetation without harcoded hyperparameters:
-'''
-import numpy as np
-
-
-def build_U(acc: np.ndarray, M: int) -> np.ndarray:
-    """Construye la matriz de regresores espacio-temporales U mediante retardos."""
-    n_ref, N = acc.shape
-    U = np.zeros((N, n_ref * M))
-    for k in range(n_ref):
-        padded = np.concatenate([np.zeros(M - 1), acc[k]])
-        for i in range(M):
-            U[:, k * M + i] = padded[M - 1 - i : M - 1 - i + N]
-    return U
-
-
-def LMS(
-    ppg1: np.ndarray,
-    ppg2: np.ndarray,
-    accx: np.ndarray,
-    accy: np.ndarray,
-    accz: np.ndarray,
+# ============================================================================
+# 1. Standard MISO LMS
+# ============================================================================
+def standard_lms(
+    d: np.ndarray,
+    acc: np.ndarray,
     M: int,
-    mu_scale: float = 0.5,
-    mu_fixed: float | None = None,
-    ppg_mode: str = "mean",
-    include_magnitude: bool = True,
-    center_only: bool = False,
-    normalized: bool = False,
-    leakage: float = 0.0,
-    eps_nlms: float = 1e-6,
+    mu: float | None = None,
+    my: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Algoritmo LMS completamente parametrizado para optimización de hiperparámetros.
+    """Standard MISO Least Mean Squares (LMS) adaptive filter.
 
-    Parámetros
-    ----------
-    ppg1, ppg2 : np.ndarray
-        Señales fotopletismográficas primarias.
-    accx, accy, accz : np.ndarray
-        Señales triaxiales del acelerómetro.
-    M : int
-        Número de coeficientes (taps) por canal de ruido.
-    mu_scale : float, default=0.5
-        Factor multiplicativo sobre mu_max = 2 / (3 * tr(R)).
-    mu_fixed : float, opcional
-        Valor escalar explícito para mu. Si se define, anula a mu_scale.
-    ppg_mode : {'mean', 'ppg1', 'ppg2', 'pca'}, default='mean'
-        Método de fusión de las dos señales PPG.
-    include_magnitude : bool, default=True
-        Si es True, concatena la norma euclídea del acelerómetro como canal adicional.
-    center_only : bool, default=False
-        Si es True, sólo centra las señales a media cero sin dividir por su desviación estándar.
-    normalized : bool, default=False
-        Si es True, activa el paso normalizado instantáneo (NLMS clásico).
-    leakage : float, default=0.0
-        Factor de fuga gamma para Leaky-LMS (0.0 equivale al LMS clásico).
-    eps_nlms : float, default=1e-6
-        Término de regularización para evitar división por cero en NLMS.
-
-    Retorna
-    -------
-    e : np.ndarray
-        Señal de error (PPG filtrada y estimada sin artefactos de movimiento).
-    y : np.ndarray
-        Señal estimada del artefacto de movimiento.
-    w : np.ndarray
-        Vector final de pesos del filtro FIR adaptativo.
-    """
-    # 1. Selección o fusión de los canales PPG
-    if ppg_mode == "mean":
-        d = 0.5 * (ppg1 + ppg2)
-    elif ppg_mode == "ppg1":
-        d = ppg1.copy()
-    elif ppg_mode == "ppg2":
-        d = ppg2.copy()
-    elif ppg_mode == "pca":
-        P = np.vstack([ppg1, ppg2])
-        P_centered = P - np.mean(P, axis=1, keepdims=True)
-        _, _, Vt = np.linalg.svd(P_centered, full_matrices=False)
-        d = Vt[0]
-    else:
-        raise ValueError(f"ppg_mode no reconocido: {ppg_mode}")
-
-    # Normalización del PPG
-    d_mean = np.mean(d)
-    d_scale = 1.0 if center_only else (np.std(d) + 1e-8)
-    d = (d - d_mean) / d_scale
-
-    # 2. Ensamblado y acondicionamiento de las señales de aceleración
-    acc_channels = [accx, accy, accz]
-    if include_magnitude:
-        acc_mag = np.sqrt(accx**2 + accy**2 + accz**2)
-        acc_channels.append(acc_mag)
-
-    acc = np.vstack(acc_channels)
-    acc_mean = np.mean(acc, axis=1, keepdims=True)
-    acc_scale = 1.0 if center_only else (np.std(acc, axis=1, keepdims=True) + 1e-8)
-    acc = (acc - acc_mean) / acc_scale
-
-    # 3. Construcción de la matriz de regresores
-    U = build_U(acc, M)
-    N, P_dim = U.shape
-
-    # 4. Determinación del paso de aprendizaje mu
-    if mu_fixed is not None:
-        mu = mu_fixed
-    else:
-        trR = np.mean(np.sum(U**2, axis=1))
-        mu_max = 2.0 / (3.0 * trR) if trR > 0 else 1e-3
-        mu = mu_scale * mu_maxs
-
-    w = np.zeros(P_dim)
-    e = np.zeros(N)
-    y = np.zeros(N)
-    leak_factor = 1.0 - leakage
-
-    # 5. Iteración adaptativa
-    for n in range(N):
-        u_n = U[n]
-        y[n] = w @ u_n
-        e[n] = d[n] - y[n]
-
-        step = mu / (u_n @ u_n + eps_nlms) if normalized else mu
-        w = leak_factor * w + step * e[n] * u_n
-
-    return e, y, w
-
-
-
-
-def Newton_LMS(
-    ppg1: np.ndarray,
-    ppg2: np.ndarray,
-    accx: np.ndarray,
-    accy: np.ndarray,
-    accz: np.ndarray,
-    M: int,
-    mu_scale: float = 0.5,
-    reg_factor: float = 1e-4,
-    ppg_mode: str = "mean",
-    include_magnitude: bool = True,
-    center_only: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Newton-LMS adaptive filter with parameterized degrees of freedom for hyperparameter tuning.
+    Minimizes the mean square error E[e^2[n]] using a fixed step size `mu`:
+        m_hat[n] = sum_{k=1}^3 w_k^T[n] a_k[n] = w^T[n] a[n]
+        e[n]     = d[n] - m_hat[n]
+        w[n + 1] = w[n] + mu * e[n] * a[n]
 
     Parameters
     ----------
-    ppg1, ppg2 : np.ndarray
-        Raw photoplethysmogram channel signals.
-    accx, accy, accz : np.ndarray
-        Tri-axial acceleration reference signals.
+    d : np.ndarray
+        Primary input signal (preprocessed PPG channel) of shape (N,).
+    acc : np.ndarray
+        Reference 3-axis accelerometer matrix of shape (3, N), or prebuilt
+        regressor matrix `U` of shape (N, 3 * M).
     M : int
-        Filter order (taps per reference channel).
-    mu_scale : float, default=0.5
-        Step-size scaling factor in range (0, 1].
-    reg_factor : float, default=1e-4
-        Diagonal loading coefficient epsilon relative to tr(R) for matrix inversion.
-    ppg_mode : {'mean', 'ppg1', 'ppg2', 'pca'}, default='mean'
-        Fusion strategy for the primary PPG channels.
-    include_magnitude : bool, default=True
-        Whether to append the acceleration norm as a fourth reference signal.
-    center_only : bool, default=False
-        If True, signals are zero-centered without unit-variance scaling.
+        Filter order (number of FIR taps per accelerometer axis; total taps = 3 * M).
+    mu : float, optional
+        Step-size hyperparameter `mu`. If None (and `my` is None), defaults to
+        `2 / (3 * tr(R))`.
+    my : float, optional
+        Alias for `mu` (step-size hyperparameter).
+
+    Returns
+    -------
+    e : np.ndarray
+        Cleared cardiac signal `e[n] = d[n] - m_hat[n]` of shape (N,).
+    m_hat : np.ndarray
+        Estimated motion artifact `m_hat[n] = w^T[n] a[n]` of shape (N,).
+    w : np.ndarray
+        Final MISO filter weight vector of shape (3 * M,).
     """
-    # 1. Primary PPG Signal Selection / Fusion
-    if ppg_mode == "mean":
-        d = 0.5 * (ppg1 + ppg2)
-    elif ppg_mode == "ppg1":
-        d = ppg1.copy()
-    elif ppg_mode == "ppg2":
-        d = ppg2.copy()
-    elif ppg_mode == "pca":
-        P = np.vstack([ppg1, ppg2])
-        P_centered = P - np.mean(P, axis=1, keepdims=True)
-        _, _, Vt = np.linalg.svd(P_centered, full_matrices=False)
-        d = Vt[0]
-    else:
-        raise ValueError(f"Unknown ppg_mode: {ppg_mode}")
+    d = np.asarray(d, dtype=float)
+    N = len(d)
+    U = _prepare_regressor(acc, N, M)
+    L = U.shape[1]
 
-    # PPG Normalization
-    d_mean = np.mean(d)
-    d_scale = 1.0 if center_only else (np.std(d) + 1e-8)
-    d = (d - d_mean) / d_scale
+    step_mu = mu if mu is not None else my
+    if step_mu is None:
+        trR = float(np.mean(np.sum(U**2, axis=1)))
+        step_mu = 2.0 / (3.0 * trR) if trR > 0 else 1e-3
 
-    # 2. Reference Signal Assembly
-    acc_channels = [accx, accy, accz]
-    if include_magnitude:
-        acc_mag = np.sqrt(accx**2 + accy**2 + accz**2)
-        acc_channels.append(acc_mag)
-
-    acc = np.vstack(acc_channels)
-    acc_mean = np.mean(acc, axis=1, keepdims=True)
-    acc_scale = 1.0 if center_only else (np.std(acc, axis=1, keepdims=True) + 1e-8)
-    acc = (acc - acc_mean) / acc_scale
-
-    # 3. Regressor Matrix Construction
-    U = build_U(acc, M)
-    N, P_dim = U.shape
-
-    # 4. Correlation Matrix and Regularized Inversion
-    R = (U.T @ U) / N
-    trR = np.trace(R)
-    epsilon = reg_factor * (trR / P_dim)
-    R_inv = np.linalg.inv(R + epsilon * np.eye(P_dim))
-
-    # 5. Step-Size Calculation
-    mu = mu_scale * (2.0 / (3.0 * trR))
-
-    # 6. Adaptive Filtering Loop
-    w = np.zeros(P_dim)
-    e = np.zeros(N)
-    y = np.zeros(N)
+    w = np.zeros(L, dtype=float)
+    e = np.zeros(N, dtype=float)
+    m_hat = np.zeros(N, dtype=float)
 
     for n in range(N):
-        u_n = U[n]
-        y[n] = w @ u_n
-        e[n] = d[n] - y[n]
-        w += mu * (R_inv @ (e[n] * u_n))
+        a_n = U[n]
+        m_hat[n] = w @ a_n
+        e[n] = d[n] - m_hat[n]
+        w = w + step_mu * e[n] * a_n
 
-    return e, y, w
+        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+            e[n:] = np.nan
+            m_hat[n:] = np.nan
+            break
 
-'''
+    return e, m_hat, w
+
+
+# ============================================================================
+# 2. Normalized MISO LMS (NLMS)
+# ============================================================================
+def nlms(
+    d: np.ndarray,
+    acc: np.ndarray,
+    M: int,
+    mu: float = 0.1,
+    delta: float = 1e-6,
+    my: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Normalized MISO Least Mean Squares (NLMS) adaptive filter.
+
+    Normalizes the learning step at each sample `n` by the instantaneous energy
+    `||a[n]||^2` of the 3-axis accelerometer regressor vector:
+        m_hat[n] = sum_{k=1}^3 w_k^T[n] a_k[n] = w^T[n] a[n]
+        e[n]     = d[n] - m_hat[n]
+        w[n + 1] = w[n] + (mu / (delta + ||a[n]||^2)) * e[n] * a[n]
+
+    Parameters
+    ----------
+    d : np.ndarray
+        Primary input signal (preprocessed PPG channel) of shape (N,).
+    acc : np.ndarray
+        Reference 3-axis accelerometer matrix of shape (3, N), or prebuilt `U` (N, 3 * M).
+    M : int
+        Filter order (number of FIR taps per accelerometer axis; total taps = 3 * M).
+    mu : float, default=0.1
+        Normalized step-size hyperparameter `mu` (stable range: 0 < mu < 2).
+    delta : float, default=1e-6
+        Regularization constant `delta > 0` to prevent division by zero when
+        accelerometer energy `||a[n]||^2` is near zero.
+    my : float, optional
+        Alias for `mu` (step-size hyperparameter).
+
+    Returns
+    -------
+    e : np.ndarray
+        Cleared cardiac signal `e[n] = d[n] - m_hat[n]` of shape (N,).
+    m_hat : np.ndarray
+        Estimated motion artifact `m_hat[n] = w^T[n] a[n]` of shape (N,).
+    w : np.ndarray
+        Final MISO filter weight vector of shape (3 * M,).
+    """
+    d = np.asarray(d, dtype=float)
+    N = len(d)
+    U = _prepare_regressor(acc, N, M)
+    L = U.shape[1]
+
+    step_mu = my if my is not None else mu
+
+    w = np.zeros(L, dtype=float)
+    e = np.zeros(N, dtype=float)
+    m_hat = np.zeros(N, dtype=float)
+
+    for n in range(N):
+        a_n = U[n]
+        m_hat[n] = w @ a_n
+        e[n] = d[n] - m_hat[n]
+        norm_step = step_mu / (delta + (a_n @ a_n))
+        w = w + norm_step * e[n] * a_n
+
+        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+            e[n:] = np.nan
+            m_hat[n:] = np.nan
+            break
+
+    return e, m_hat, w
+
+
+# ============================================================================
+# 3. Variable Step-Size MISO LMS (VS-LMS)
+# ============================================================================
+def vs_lms(
+    d: np.ndarray,
+    acc: np.ndarray,
+    M: int,
+    mu_max: float | None = None,
+    mu_min: float = 1e-5,
+    alpha: float = 0.97,
+    gamma: float = 1e-3,
+    mu_init: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Variable Step-Size MISO LMS (VS-LMS) adaptive filter (Kwong & Johnston, 1992).
+
+    Dynamically adapts the step size `mu[n]` at every sample based on the instantaneous
+    squared prediction error `e^2[n]`:
+        m_hat[n]   = sum_{k=1}^3 w_k^T[n] a_k[n] = w^T[n] a[n]
+        e[n]       = d[n] - m_hat[n]
+        w[n + 1]   = w[n] + mu[n] * e[n] * a[n]
+        mu'[n + 1] = alpha * mu[n] + gamma * e^2[n]
+        mu[n + 1]  = clip(mu'[n + 1], mu_min, mu_max)
+
+    Parameters
+    ----------
+    d : np.ndarray
+        Primary input signal (preprocessed PPG channel) of shape (N,).
+    acc : np.ndarray
+        Reference 3-axis accelerometer matrix of shape (3, N), or prebuilt `U` (N, 3 * M).
+    M : int
+        Filter order (number of FIR taps per accelerometer axis; total taps = 3 * M).
+    mu_max : float, optional
+        Upper bound on the step size to guarantee stability. If None, defaults to
+        `2 / (3 * tr(R))`.
+    mu_min : float, default=1e-5
+        Lower bound on the step size (`0 < mu_min < mu_max`).
+    alpha : float, default=0.97
+        Exponential forgetting factor in `(0, 1)` controlling how quickly `mu[n]`
+        decays when the error is small.
+    gamma : float, default=1e-3
+        Error sensitivity coefficient (`gamma > 0`) controlling how strongly squared
+        error `e^2[n]` increases the step size.
+    mu_init : float, optional
+        Initial step size `mu[0]`. Defaults to `mu_max`.
+
+    Returns
+    -------
+    e : np.ndarray
+        Cleared cardiac signal `e[n] = d[n] - m_hat[n]` of shape (N,).
+    m_hat : np.ndarray
+        Estimated motion artifact `m_hat[n] = w^T[n] a[n]` of shape (N,).
+    w : np.ndarray
+        Final MISO filter weight vector of shape (3 * M,).
+    """
+    d = np.asarray(d, dtype=float)
+    N = len(d)
+    U = _prepare_regressor(acc, N, M)
+    L = U.shape[1]
+
+    if mu_max is None:
+        trR = float(np.mean(np.sum(U**2, axis=1)))
+        mu_max = 2.0 / (3.0 * trR) if trR > 0 else 1e-2
+
+    effective_mu_min = min(mu_min, mu_max * 0.5)
+    mu_n = mu_init if mu_init is not None else mu_max
+
+    w = np.zeros(L, dtype=float)
+    e = np.zeros(N, dtype=float)
+    m_hat = np.zeros(N, dtype=float)
+
+    for n in range(N):
+        a_n = U[n]
+        m_hat[n] = w @ a_n
+        e[n] = d[n] - m_hat[n]
+        w = w + mu_n * e[n] * a_n
+
+        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+            e[n:] = np.nan
+            m_hat[n:] = np.nan
+            break
+
+        mu_next = alpha * mu_n + gamma * (e[n] ** 2)
+        if mu_next > mu_max:
+            mu_n = mu_max
+        elif mu_next < effective_mu_min:
+            mu_n = effective_mu_min
+        else:
+            mu_n = mu_next
+
+    return e, m_hat, w
+
+
+# ============================================================================
+# Registry of LMS Algorithms & Bucket Function with Dual PPG Late Fusion
+# ============================================================================
+LMS_REGISTRY: dict[str, callable] = {
+    "standard_lms": standard_lms,
+    "lms": standard_lms,
+    "nlms": nlms,
+    "vs_lms": vs_lms,
+    "vslms": vs_lms,
+}
+
+
+def lms_bucket(
+    ppg1: np.ndarray,
+    ppg2: np.ndarray,
+    acc: np.ndarray,
+    algorithm: str = "standard_lms",
+    M: int = 16,
+    return_details: bool = False,
+    **hyperparams,
+) -> np.ndarray | tuple[np.ndarray, dict]:
+    """Bucket function to select an LMS algorithm with hyperparameters and apply Late Fusion.
+
+    Executes Dual PPG Parallel Filtering + SNR-Weighted Late Fusion on a window:
+    1. Builds the shared MISO accelerometer regressor matrix `U = build_U(acc, M)` once.
+    2. Runs the chosen LMS variant (`standard_lms`, `nlms`, or `vs_lms`)
+       on `ppg1` (`d_1[n]`) -> yields cleaned signal `e_1[n]`.
+    3. Runs the chosen LMS variant in parallel with the same hyperparameters
+       on `ppg2` (`d_2[n]`) -> yields cleaned signal `e_2[n]`.
+    4. Combines `e_1[n]` and `e_2[n]` via SNR-Weighted Averaging (`snr_weighted_late_fusion`)
+       to produce the reconstructed cardiac signal `e_fused[n]`.
+
+    Parameters
+    ----------
+    ppg1 : np.ndarray
+        Preprocessed primary PPG channel 1 (`d_1[n]`) of shape (N,).
+    ppg2 : np.ndarray
+        Preprocessed primary PPG channel 2 (`d_2[n]`) of shape (N,).
+    acc : np.ndarray
+        Preprocessed 3-axis accelerometer reference signal of shape (3, N).
+    algorithm : {'standard_lms', 'lms', 'nlms', 'vs_lms'}, default='standard_lms'
+        Name of the LMS algorithm variant to execute.
+    M : int, default=16
+        Filter order (number of taps per accelerometer axis; total taps = 3 * M).
+    return_details : bool, default=False
+        If False (default), returns only the fused cardiac signal `e_fused`.
+        If True, returns `(e_fused, details_dict)`.
+    **hyperparams
+        Algorithm-specific hyperparameters passed directly to the chosen LMS function:
+        - For `'standard_lms'`: `mu` (or `my`)
+        - For `'nlms'`: `mu` (or `my`), `delta`
+        - For `'vs_lms'`: `mu_max`, `mu_min`, `alpha`, `gamma`, `mu_init`
+
+    Returns
+    -------
+    e_fused : np.ndarray
+        Reconstructed cardiac signal after parallel LMS filtering and SNR-weighted Late Fusion.
+    details : dict, optional
+        Returned only if `return_details=True`. Contains keys:
+        `'e1'`, `'e2'`, `'m_hat1'`, `'m_hat2'`, `'w1'`, `'w2'`, `'fusion_info'`.
+    """
+    algo_key = algorithm.strip().lower().replace("-", "_")
+    if algo_key not in LMS_REGISTRY:
+        valid = ", ".join(sorted(LMS_REGISTRY.keys()))
+        raise ValueError(f"Unknown LMS algorithm '{algorithm}'. Valid options: {valid}")
+
+    lms_fn = LMS_REGISTRY[algo_key]
+
+    # Build the MISO regressor matrix U once and share it across both parallel PPG branches
+    U = build_U(acc, M)
+
+    # Parallel Filtering: Branch 1 (PPG1) and Branch 2 (PPG2)
+    e1, m_hat1, w1 = lms_fn(ppg1, U, M=M, **hyperparams)
+    e2, m_hat2, w2 = lms_fn(ppg2, U, M=M, **hyperparams)
+
+    # Late Fusion via SNR-Weighted Averaging
+    e_fused, fusion_info = snr_weighted_late_fusion(
+        e1,
+        e2,
+        return_weights=True,
+    )
+
+    if return_details:
+        return e_fused, {
+            "e1": e1,
+            "e2": e2,
+            "m_hat1": m_hat1,
+            "m_hat2": m_hat2,
+            "w1": w1,
+            "w2": w2,
+            "fusion_info": fusion_info,
+        }
+    return e_fused
