@@ -270,24 +270,27 @@ def estimate_bpm_window(
 def objective_function(
     bpm_estimated: np.ndarray | list[float],
     bpm_true: np.ndarray | list[float],
+    rmse_weight: float = 0.35,
+    outlier_threshold: float = 10.0,
+    outlier_weight: float = 0.50,
 ) -> float:
-    """Objective function computing the Mean Absolute Error (AAE in BPM) across windows.
+    """Outlier-penalized composite objective for hyperparameter optimization.
 
-    Parameters
-    ----------
-    bpm_estimated : array-like of shape (n_windows,)
-        Estimated BPM for each individual window.
-    bpm_true : array-like of shape (n_windows,)
-        Ground-truth reference BPM for each individual window.
-
-    Returns
-    -------
-    float
-        Average Absolute Error `mean(|bpm_estimated - bpm_true|)` in BPM.
-        Returns `np.inf` if any window estimate is NaN or infinite.
+    Combines Mean Absolute Error (AAE) with an RMSE variance penalty and a soft
+    hinge penalty on errors exceeding `outlier_threshold` (default 10 BPM) to
+    prevent TPE from selecting fragile hyperparameters that lock onto harmonics
+    or motion artifacts during intense movement.
     """
     est = np.asarray(bpm_estimated, dtype=float)
     true = np.asarray(bpm_true, dtype=float)
     if est.size == 0 or not np.all(np.isfinite(est)):
         return float("inf")
-    return float(np.mean(np.abs(est - true)))
+
+    abs_err = np.abs(est - true)
+    aae = float(np.mean(abs_err))
+    rmse = float(np.sqrt(np.mean(abs_err ** 2)))
+    
+    # Soft hinge penalty for catastrophic tracking failures (> 10 BPM error)
+    excess_outlier_err = float(np.mean(np.maximum(0.0, abs_err - outlier_threshold)))
+
+    return aae + (rmse_weight * rmse) + (outlier_weight * excess_outlier_err)
