@@ -1,125 +1,88 @@
 ================================================================================
-RESTRUCTURED IMPLEMENTATION - CODE STRUCTURE & PIPELINE SUMMARY
+CODE STRUCTURE SUMMARY: restructured_implementation/
 ================================================================================
 
-OVERVIEW
---------
-This folder contains the modular implementation of the 5-dimensional PPG +
-Triaxial Accelerometer Heart Signal Reconstruction and Joint Bayesian
-Hyperparameter Optimization pipeline. Every 8-second window (N = 1000 samples
-at fs = 125 Hz) is processed individually in a single forward pass to match the
-test-time evaluation protocol, while cross-validation splits are strictly grouped
-by participant/recording session to prevent data leakage.
+Overview:
+---------
+A clean, minimal, modular implementation of the 5-dimensional Dual-PPG + 3-Axis
+Accelerometer Heart Signal Reconstruction and Separate LMS Hyperparameter
+Optimization Pipeline. Preprocessing and BPM detection are kept strictly minimal
+so that the MISO LMS adaptive filter is the core motion-cancellation mechanism.
 
-DIRECTORY STRUCTURE
--------------------
+Directory Structure:
+--------------------
 restructured_implementation/
-├── __init__.py                  # Package exports for all pipeline & optimization modules
-├── dataset_preparation.py       # .ts loader, participant detection, Subject-Wise Group K-Fold
-├── preprocessing.py             # Zero-phase Butterworth bandpass, 4th acc_mag channel & normalization
-├── reference_construction.py    # 4-channel MISO delay-line regressor matrix U construction (build_U)
-├── LMS_algorithms.py            # Single-pass Standard LMS, NLMS, Normalized VS-LMS, and Late-Fusion bucket
-├── fusion.py                    # Batched 2048-FFT SNR + Inverse-Correlation Late Fusion & Supervised SNR
-├── bpm_detection.py             # Additive Motion-Suppressed Harmonic Periodogram (+ Parabolic Interp)
-├── pipeline.py                  # Window-level signal reconstruction & HeartRateEstimatorModel
-├── optimization.py              # 2-Phase Conditional TPE Optimization with Spectral Caching & Pruning
-├── pipeline_optimization_and_evaluation.ipynb # Notebook: pipeline docs, TPE optimization & visualizations
-├── code_structure_summary.txt   # This architecture and module reference summary
-└── tests_on_dataset/
-    └── participant_split.py     # Dataset ordering and participant boundary verification script
+├── __init__.py
+├── dataset_preparation.py
+├── preprocessing.py
+├── reference_construction.py
+├── LMS_algorithms.py
+├── fusion.py
+├── bpm_detection.py
+├── pipeline.py
+├── optimization.py
+├── pipeline_optimization_and_evaluation.ipynb
+└── code_structure_summary.txt
 
---------------------------------------------------------------------------------
-1. DATASET PREPARATION & SUBJECT-WISE VALIDATION (dataset_preparation.py)
---------------------------------------------------------------------------------
-- `load_ts(path)`:
-  Reads multivariate .ts files and returns `X` of shape (n_windows, 5, 1000)
-  with channels [ppg1, ppg2, accx, accy, accz] and ground-truth BPM `y` (n_windows,).
-- `split_participants(X, step=250, tol=1e-3)`:
-  Identifies contiguous recording sessions by checking the 750-sample overlap
-  between consecutive windows without merging windows.
-- `get_participant_groups(X, step=250, tol=1e-3)`:
-  Returns an integer array `groups` of shape (n_windows,) with the participant ID
-  for each individual window.
-- `subject_wise_group_kfold(X, n_splits=5, ...)`:
-  Partitions window indices into K balanced folds strictly grouped by participant ID
-  so that all windows of a given subject stay in the same fold (zero data leakage).
+Module Breakdown:
+-----------------
+1. dataset_preparation.py
+   - `load_ts(path)`: Loads 5D windows `(n_windows, 5, 1000)` and BPM labels `y`.
+   - `split_participants(X)` & `get_participant_groups(X)`: Detects recording
+     session / participant boundaries via 750-sample overlap matching without
+     merging windows.
+   - `subject_wise_group_kfold(X, n_splits=5)`: Partitions windows strictly by
+     subject ID using `sklearn.model_selection.GroupKFold` to prevent data leakage.
 
---------------------------------------------------------------------------------
-2. PREPROCESSING & 4TH ACCELEROMETER CHANNEL (preprocessing.py)
---------------------------------------------------------------------------------
-- `bandpass(x, lo=0.5, hi=4.0, fs=125, order=3, causal=False)`:
-  Applies a 3rd-order Butterworth bandpass filter over the cardiac frequency band
-  0.5 Hz - 4.0 Hz (30 BPM - 240 BPM):
-  * When `causal=False` (default): Uses `sosfiltfilt(..., padtype="odd", padlen=min(250, N-1))`
-    to eliminate startup ringing transients and preserve zero-phase alignment.
-  * When `causal=True`: Scales initial filter states `sosfilt_zi(sos)` by `x[..., :1]`.
-- `normalize_amplitude(x, eps=1e-8)`:
-  Zero-centers and scales each channel to unit standard deviation along `axis=-1`.
-- `prepare_channels(window, fs=125, lo=0.5, hi=4.0, order=3, causal=False)`:
-  Computes the 4th non-linear accelerometer magnitude channel `acc_mag = sqrt(accx^2 + accy^2 + accz^2)`
-  before bandpass filtering, filters and normalizes all 6 channels, and returns
-  `ppg_norm` `(2, N)` and `acc_norm` `(4, N)`.
+2. preprocessing.py
+   - `bandpass(x, lo=0.5, hi=4.0, fs=125, order=4, causal=False)`: 4th-order
+     zero-phase Butterworth bandpass filter in the cardiac band (30 - 240 BPM).
+   - `normalize_amplitude(x)`: Zero-mean, unit-variance normalization per channel.
+   - `preprocess_signal(x)`: Minimal preprocessing returning `(ppg1, ppg2, acc)`
+     where `acc` has shape `(3, N)` (`[accx, accy, accz]`).
 
---------------------------------------------------------------------------------
-3. MISO REFERENCE SIGNAL CONSTRUCTION (reference_construction.py)
---------------------------------------------------------------------------------
-- `build_U(acc, M, pad_mode="edge")`:
-  Constructs the `(N, 4*M)` spatio-temporal delay matrix `U` from the K=4
-  normalized accelerometer channels (`accx, accy, accz, acc_mag`) with edge
-  pre-window padding so that `m_hat[n] = sum_{k=1}^{4} w_k^T[n] a_k[n] = w^T[n] U[n]`.
+3. reference_construction.py
+   - `build_U(acc, M)`: Constructs the `(N, 3 * M)` MISO tapped-delay regressor
+     matrix for $\hat{m}[n] = \sum_{k=1}^3 \mathbf{w}_k^T[n]\mathbf{a}_k[n]$.
 
---------------------------------------------------------------------------------
-4. SINGLE-PASS ADAPTIVE LMS ALGORITHMS & LATE FUSION (LMS_algorithms.py & fusion.py)
---------------------------------------------------------------------------------
-All LMS algorithms perform a single forward pass from n = 0 to N - 1 starting
-from `w_init` (defaulting to zeros of shape `(4*M,)`) using pre-allocated arrays
-and `np.dot(w, U[n])`:
-- `standard_lms(d, acc, M, mu=None, my=None, w_init=None)`:
-  Standard MISO LMS with step size `mu` in `[1e-4, 0.006]` (default `0.08 / (4*M)`)
-  and L-infinity weight clipping (`||w[n]||_inf <= 10.0`).
-- `nlms(d, acc, M, mu=0.08, delta=0.1, my=None, w_init=None)`:
-  Normalized MISO LMS with precomputed regressor energy `delta + ||a[n]||^2`.
-- `vs_lms(d, acc, M, mu_max=0.10, mu_min=0.005, alpha=0.96, gamma=1e-3, delta=0.05, ...)`:
-  Normalized Kwong & Johnston Variable Step-Size MISO LMS:
-      w[n+1]  = w[n] + (mu[n] / (delta + ||a[n]||^2)) * e[n] * a[n]
-      mu[n+1] = clip(alpha * mu[n] + gamma * e^2[n], mu_min, mu_max)
-- `supervised_cardiac_snr(e_fused, bpm_true, m_hat=None, d=None, nfft=4096)`:
-  Supervised Ground-Truth Spectral SNR around `f_true = bpm_true / 60` (`+/- 0.06 Hz`)
-  and `2 * f_true` (`+/- 0.08 Hz`) with non-adaptation penalty (`||m_hat||_2 > 0.02 * ||d||_2`).
-- `compute_snr_weights` & `snr_weighted_late_fusion`:
-  Single batched 2D `rfft` (`nfft = 2048`) on `np.vstack([e1, e2])`, weighting each
-  branch by its motion-penalized spectral concentration ratio (`SNR_i`, using the 3
-  linear axes `acc[:3]`) and inverse residual accelerometer correlation:
-      c_i = (1 / 3) * sum_{k=0}^2 |corr(e_i, a_k)|,   w_i proportional to SNR_i * (1 - 0.5 * c_i)
+4. LMS_algorithms.py
+   - `standard_lms(d, acc, M, mu)`: Standard MISO LMS filter.
+   - `nlms(d, acc, M, mu, delta)`: Normalized MISO LMS filter.
+   - `vs_lms(d, acc, M, mu_max, mu_min, alpha, gamma, delta)`: Kwong-Johnston
+     Variable Step-Size MISO LMS filter.
+   - `lms_bucket(ppg1, ppg2, acc, algorithm, M, **hyperparams)`: Runs the selected
+     LMS variant in parallel on `ppg1` and `ppg2` and fuses `e1` and `e2` via
+     `snr_weighted_late_fusion`.
 
---------------------------------------------------------------------------------
-5. HEART RATE ESTIMATION & OBJECTIVE FUNCTION (bpm_detection.py)
---------------------------------------------------------------------------------
-- `motion_suppressed_periodogram_bpm(e_fused, acc_norm=None, psd_acc_band=None, fs=125, nfft=4096, lo=0.5, hi=3.8, window_type='hamming', suppression_alpha=0.25, harmonic_weight=0.25)`:
-  1. Uses `nfft` in `{4096, 8192}` with cached window taper and FFT frequency grids.
-  2. Normalizes `psd_e` and mean 3-axis linear accelerometer `psd_acc` (`acc_norm[:3]`)
-     in `[0.5, 3.8] Hz` (`30 - 228 BPM`) to unit maximum.
-  3. Additive soft spectral subtraction:
-         clean_psd = maximum(0.05 * psd_e_band, psd_e_band - suppression_alpha * psd_acc_band)
-  4. Reinforces fundamentals with a 2nd harmonic at `2f` and penalizes 2nd-harmonic
-     lock above `2.2 Hz` (`132 BPM`) when `f / 2` has a strong clean cardiac peak.
-  5. Applies 3-point parabolic interpolation on `log(score[idx_max - 1 : idx_max + 2])`.
+5. fusion.py
+   - `estimate_cardiac_snr(sig)`: In-band cardiac spectral SNR in `[0.5, 4.0] Hz`.
+   - `compute_snr_weights(e1, e2)` & `snr_weighted_late_fusion(e1, e2)`: Combines
+     parallel-filtered PPG channels using SNR weights $w_i = \text{SNR}_i / (\text{SNR}_1 + \text{SNR}_2)$.
 
---------------------------------------------------------------------------------
-6. JOINT 2-PHASE TPE OPTIMIZATION WITH SPECTRAL CACHING (optimization.py)
---------------------------------------------------------------------------------
-- Conditional Tree Search Space (`CONDITIONAL_SEARCH_SPACE`, `MAX_M = 15`):
-  * `standard_lms` -> `M` in [4, 15], `mu` in [1e-4, 0.006]
-  * `nlms`         -> `M` in [4, 15], `mu` in [0.015, 0.25], `delta` in [0.01, 0.5]
-  * `vs_lms`       -> `M` in [4, 15], `mu_max` in [0.02, 0.30], `mu_min` in [0.001, 0.02],
-                      `alpha` in [0.92, 0.995], `gamma` in [1e-4, 0.02]
-  * `periodogram`  -> `nfft` in {4096, 8192}, `window_type` in {'hann', 'hamming', 'blackman'},
-                      `suppression_alpha` in [0.05, 0.50], `harmonic_weight` in [0.05, 0.50]
-  * `elgendi`      -> `w1_sec` in [0.08, 0.16], `w2_sec` in [0.55, 0.85], `beta_offset` in [0.005, 0.10]
-- `preprocess_dataset_windows(X, ...)`:
-  Precomputes and caches `(ppg1, ppg2, acc_norm, U_max_3d, psd_acc_2048, psd_acc_4096, psd_acc_8192, a_unit_3)`
-  once per window so accelerometer FFTs are never recomputed during Phase 1 or Phase 2.
-- `run_phase1_snr_screening(..., n_trials=36)` & `run_phase2_tpe_optimization(..., n_trials=45)`:
-  Supervised Phase 1 screening (12 trials per LMS family on 250 windows) followed by
-  unpruned warm-start evaluation of all 6 `(LMS x HR)` pairs and 5-fold TPE optimization.
+6. bpm_detection.py
+   - `zero_padded_periodogram_bpm(x, fs=125, nfft=8192, lo=0.5, hi=4.0, window_type='hann')`:
+     Direct zero-padded periodogram peak detector in `[0.5, 4.0] Hz`.
+   - `elgendi_systolic_peak_bpm(x, fs=125, w1_sec, w2_sec, beta_offset)`:
+     Time-domain systolic peak heart rate detector.
+   - `estimate_bpm_window(e_window, hr_algorithm, **hr_params)`: HR bucket function.
+   - `objective_function(bpm_estimated, bpm_true)`: Outlier-penalized error metric.
+
+7. pipeline.py
+   - `reconstruct_heart_signal(window_5d, ...)`: End-to-end window signal cleaning.
+   - `predict_window_bpm(window_5d, ...)`: End-to-end single-window BPM prediction.
+   - `HeartRateEstimatorModel`: Encapsulates a configured LMS + HR pipeline with
+     `.predict(X)` and `.predict_with_signals(X)`.
+
+8. optimization.py
+   - `optimize_hr_pipeline(X, y, n_splits=5, ...)`: Evaluates `standard_lms`,
+     `nlms`, and `vs_lms` separately using Subject-Wise Group K-Fold CV and
+     2-phase Conditional TPE optimization with `MedianFoldPruner`, plus evaluates
+     the Before-LMS baseline (`evaluate_baseline_without_lms`).
+
+9. pipeline_optimization_and_evaluation.ipynb
+   - Presents the pipeline, outputs the selected hyperparameters and CV/Test
+     performance for each of the 3 LMS types vs. the Before-LMS baseline, plots
+     the spread of Test BPMs colored by subject, visualizes a single window
+     changing across each pipeline step, and compares the raw vs. cleaned signal
+     of a good example and an outlier example.
 ================================================================================

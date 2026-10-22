@@ -1,6 +1,6 @@
 """
-Restructured implementation of the Dual-PPG + 4-Channel Accelerometer
-Heart Signal Reconstruction and Joint TPE Hyperparameter Optimization Pipeline.
+Restructured implementation of the Dual-PPG + 3-Axis Accelerometer
+Heart Signal Reconstruction and Group K-Fold Hyperparameter Optimization Pipeline.
 """
 
 from .dataset_preparation import (
@@ -16,7 +16,6 @@ from .dataset_preparation import (
 from .preprocessing import (
     bandpass,
     normalize_amplitude,
-    prepare_channels,
     preprocess_signal,
 )
 from .reference_construction import (
@@ -29,15 +28,11 @@ from .LMS_algorithms import (
     lms_bucket,
 )
 from .fusion import (
-    compute_acc_linear_psd_band,
-    supervised_cardiac_snr,
     estimate_cardiac_snr,
     compute_snr_weights,
     snr_weighted_late_fusion,
 )
 from .bpm_detection import (
-    precompute_acc_psd_band,
-    motion_suppressed_periodogram_bpm,
     zero_padded_periodogram_bpm,
     bpm_from_window,
     elgendi_systolic_peak_bpm,
@@ -57,6 +52,7 @@ from .optimization import (
     preprocess_dataset_windows,
     run_phase1_snr_screening,
     run_phase2_tpe_optimization,
+    evaluate_baseline_without_lms,
     summarize_algorithm_comparisons,
     optimize_hr_pipeline,
 )
@@ -72,20 +68,15 @@ __all__ = [
     "subject_wise_group_kfold",
     "bandpass",
     "normalize_amplitude",
-    "prepare_channels",
     "preprocess_signal",
     "build_U",
     "standard_lms",
     "nlms",
     "vs_lms",
     "lms_bucket",
-    "compute_acc_linear_psd_band",
-    "supervised_cardiac_snr",
     "estimate_cardiac_snr",
     "compute_snr_weights",
     "snr_weighted_late_fusion",
-    "precompute_acc_psd_band",
-    "motion_suppressed_periodogram_bpm",
     "zero_padded_periodogram_bpm",
     "bpm_from_window",
     "elgendi_systolic_peak_bpm",
@@ -101,6 +92,7 @@ __all__ = [
     "preprocess_dataset_windows",
     "run_phase1_snr_screening",
     "run_phase2_tpe_optimization",
+    "evaluate_baseline_without_lms",
     "summarize_algorithm_comparisons",
     "optimize_hr_pipeline",
 ]
