@@ -21,6 +21,8 @@ from .fusion import snr_weighted_late_fusion
 
 # Divergence threshold to detect numerical instability during adaptation
 DIV_THR: float = 1e3
+# Maximum L-infinity norm for standard LMS weights to prevent step-size explosion
+MAX_WEIGHT_NORM: float = 10.0
 
 
 def _prepare_regressor(acc_or_U: np.ndarray, N: int, M: int) -> np.ndarray:
@@ -47,7 +49,7 @@ def standard_lms(
     Adapts online in a single forward pass from n = 0 to N - 1:
         m_hat[n] = sum_{k=1}^{4} w_k^T[n] a_k[n] = w^T[n] a[n]
         e[n]     = d[n] - m_hat[n]
-        w[n + 1] = w[n] + mu * e[n] * a[n]
+        w[n + 1] = clip(w[n] + mu * e[n] * a[n], -10, 10)
 
     Parameters
     ----------
@@ -59,8 +61,8 @@ def standard_lms(
     M : int
         Filter order (number of FIR taps per reference channel; total taps = 4 * M).
     mu : float, optional
-        Step-size hyperparameter `mu` (e.g. in `[5e-4, 2e-2]`). If None, defaults to
-        `2 / (3 * tr(R))`.
+        Step-size hyperparameter `mu` (search range `[1e-4, 0.006]`). If None, defaults
+        to `0.08 / (4 * M)`.
     my : float, optional
         Alias for `mu`.
     w_init : np.ndarray, optional
@@ -82,23 +84,29 @@ def standard_lms(
 
     step_mu = mu if mu is not None else my
     if step_mu is None:
-        trR = float(np.mean(np.sum(U**2, axis=1)))
-        step_mu = 2.0 / (3.0 * trR) if trR > 0 else 1e-3
+        step_mu = 0.08 / float(max(1, L))
+    step_mu = float(step_mu)
 
     w = np.zeros(L, dtype=float) if w_init is None else np.array(w_init, dtype=float, copy=True)
-    e = np.zeros(N, dtype=float)
-    m_hat = np.zeros(N, dtype=float)
+    e = np.empty(N, dtype=float)
+    m_hat = np.empty(N, dtype=float)
 
+    dot = np.dot
     for n in range(N):
         a_n = U[n]
-        m_hat[n] = w @ a_n
-        e[n] = d[n] - m_hat[n]
-        w = w + step_mu * e[n] * a_n
+        m_n = float(dot(w, a_n))
+        e_n = d[n] - m_n
+        m_hat[n] = m_n
+        e[n] = e_n
 
-        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+        if not np.isfinite(e_n) or abs(e_n) > DIV_THR:
             e[n:] = np.nan
             m_hat[n:] = np.nan
             break
+
+        w += (step_mu * e_n) * a_n
+        if np.max(np.abs(w)) > MAX_WEIGHT_NORM:
+            np.clip(w, -MAX_WEIGHT_NORM, MAX_WEIGHT_NORM, out=w)
 
     return e, m_hat, w
 
@@ -110,8 +118,8 @@ def nlms(
     d: np.ndarray,
     acc: np.ndarray,
     M: int,
-    mu: float = 0.2,
-    delta: float = 1e-2,
+    mu: float = 0.08,
+    delta: float = 0.1,
     my: float | None = None,
     w_init: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -131,10 +139,10 @@ def nlms(
         Reference 4-channel accelerometer matrix of shape `(4, N)`, or prebuilt `U` `(N, 4 * M)`.
     M : int
         Filter order (number of FIR taps per reference channel; total taps = 4 * M).
-    mu : float, default=0.2
-        Normalized step-size hyperparameter `mu` (search range `[0.05, 0.8]`).
-    delta : float, default=1e-2
-        Regularization constant `delta > 0` (search range `[1e-4, 1e-1]`).
+    mu : float, default=0.08
+        Normalized step-size hyperparameter `mu` (search range `[0.015, 0.25]`).
+    delta : float, default=0.1
+        Regularization constant `delta > 0` (search range `[0.01, 0.5]`).
     my : float, optional
         Alias for `mu`.
     w_init : np.ndarray, optional
@@ -154,49 +162,56 @@ def nlms(
     U = _prepare_regressor(acc, N, M)
     L = U.shape[1]
 
-    step_mu = my if my is not None else mu
+    step_mu = float(my if my is not None else mu)
+    # Precompute instantaneous regressor power ||a[n]||^2 + delta in vectorized C
+    inv_denom = step_mu / (float(delta) + np.einsum("ij,ij->i", U, U))
 
     w = np.zeros(L, dtype=float) if w_init is None else np.array(w_init, dtype=float, copy=True)
-    e = np.zeros(N, dtype=float)
-    m_hat = np.zeros(N, dtype=float)
+    e = np.empty(N, dtype=float)
+    m_hat = np.empty(N, dtype=float)
 
+    dot = np.dot
     for n in range(N):
         a_n = U[n]
-        m_hat[n] = w @ a_n
-        e[n] = d[n] - m_hat[n]
-        norm_step = step_mu / (delta + (a_n @ a_n))
-        w = w + norm_step * e[n] * a_n
+        m_n = float(dot(w, a_n))
+        e_n = d[n] - m_n
+        m_hat[n] = m_n
+        e[n] = e_n
 
-        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+        if not np.isfinite(e_n) or abs(e_n) > DIV_THR:
             e[n:] = np.nan
             m_hat[n:] = np.nan
             break
+
+        w += (inv_denom[n] * e_n) * a_n
 
     return e, m_hat, w
 
 
 # ============================================================================
-# 3. Variable Step-Size MISO LMS (VS-LMS, Single-Pass)
+# 3. Normalized Variable Step-Size MISO LMS (VS-LMS, Single-Pass)
 # ============================================================================
 def vs_lms(
     d: np.ndarray,
     acc: np.ndarray,
     M: int,
-    mu_max: float = 0.02,
-    mu_min: float = 5e-4,
-    alpha: float = 0.95,
+    mu_max: float = 0.10,
+    mu_min: float = 0.005,
+    alpha: float = 0.96,
     gamma: float = 1e-3,
+    delta: float = 0.05,
     mu_init: float | None = None,
     w_init: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Single-pass Variable Step-Size MISO LMS (VS-LMS) adaptive filter (Kwong & Johnston, 1992).
+    """Single-pass Normalized Kwong-Johnston Variable Step-Size MISO LMS (VS-LMS) filter.
 
-    Adapts online in a single forward pass from n = 0 to N - 1:
+    Adapts online in a single forward pass from n = 0 to N - 1, normalizing the weight
+    update by the instantaneous regressor energy `delta + ||a[n]||^2` so adaptation
+    can never diverge to `inf`:
         m_hat[n]   = sum_{k=1}^{4} w_k^T[n] a_k[n] = w^T[n] a[n]
         e[n]       = d[n] - m_hat[n]
-        w[n + 1]   = w[n] + mu[n] * e[n] * a[n]
-        mu'[n + 1] = alpha * mu[n] + gamma * e^2[n]
-        mu[n + 1]  = clip(mu'[n + 1], mu_min, mu_max)
+        w[n + 1]   = w[n] + (mu[n] / (delta + ||a[n]||^2)) * e[n] * a[n]
+        mu[n + 1]  = clip(alpha * mu[n] + gamma * e^2[n], mu_min, mu_max)
 
     Parameters
     ----------
@@ -206,14 +221,16 @@ def vs_lms(
         Reference 4-channel accelerometer matrix of shape `(4, N)`, or prebuilt `U` `(N, 4 * M)`.
     M : int
         Filter order (number of FIR taps per reference channel; total taps = 4 * M).
-    mu_max : float, default=0.02
-        Upper bound on the step size (`[0.005, 0.08]`).
-    mu_min : float, default=5e-4
-        Lower bound on the step size (`[1e-4, 0.005]`, `mu_min < mu_max`).
-    alpha : float, default=0.95
-        Exponential forgetting factor in `[0.90, 0.995]`.
+    mu_max : float, default=0.10
+        Upper bound on the normalized step size (`[0.02, 0.30]`).
+    mu_min : float, default=0.005
+        Lower bound on the normalized step size (`[0.001, 0.02]`, `mu_min < mu_max`).
+    alpha : float, default=0.96
+        Exponential forgetting factor in `[0.92, 0.995]`.
     gamma : float, default=1e-3
-        Error sensitivity coefficient in `[1e-4, 1e-2]`.
+        Error sensitivity coefficient in `[1e-4, 0.02]`.
+    delta : float, default=0.05
+        Regularization constant `delta > 0` for power normalization.
     mu_init : float, optional
         Initial step size `mu[0]`. Defaults to `mu_max`.
     w_init : np.ndarray, optional
@@ -234,28 +251,36 @@ def vs_lms(
     L = U.shape[1]
 
     if mu_max is None:
-        trR = float(np.mean(np.sum(U**2, axis=1)))
-        mu_max = 2.0 / (3.0 * trR) if trR > 0 else 0.02
+        mu_max = 0.10
+    mu_max = float(mu_max)
+    effective_mu_min = float(min(mu_min, mu_max * 0.5))
+    mu_n = float(mu_init if mu_init is not None else mu_max)
+    alpha = float(alpha)
+    gamma = float(gamma)
 
-    effective_mu_min = min(mu_min, mu_max * 0.5)
-    mu_n = mu_init if mu_init is not None else mu_max
+    # Precompute inverse regressor energy 1 / (delta + ||a[n]||^2) outside the loop
+    inv_power = 1.0 / (float(delta) + np.einsum("ij,ij->i", U, U))
 
     w = np.zeros(L, dtype=float) if w_init is None else np.array(w_init, dtype=float, copy=True)
-    e = np.zeros(N, dtype=float)
-    m_hat = np.zeros(N, dtype=float)
+    e = np.empty(N, dtype=float)
+    m_hat = np.empty(N, dtype=float)
 
+    dot = np.dot
     for n in range(N):
         a_n = U[n]
-        m_hat[n] = w @ a_n
-        e[n] = d[n] - m_hat[n]
-        w = w + mu_n * e[n] * a_n
+        m_n = float(dot(w, a_n))
+        e_n = d[n] - m_n
+        m_hat[n] = m_n
+        e[n] = e_n
 
-        if not np.isfinite(e[n]) or abs(e[n]) > DIV_THR:
+        if not np.isfinite(e_n) or abs(e_n) > DIV_THR:
             e[n:] = np.nan
             m_hat[n:] = np.nan
             break
 
-        mu_next = alpha * mu_n + gamma * (e[n] ** 2)
+        w += (mu_n * inv_power[n] * e_n) * a_n
+
+        mu_next = alpha * mu_n + gamma * (e_n * e_n)
         if mu_next > mu_max:
             mu_n = mu_max
         elif mu_next < effective_mu_min:
@@ -283,8 +308,9 @@ def lms_bucket(
     ppg2: np.ndarray,
     acc: np.ndarray,
     algorithm: str = "standard_lms",
-    M: int = 16,
+    M: int = 10,
     w_init: np.ndarray | None = None,
+    psd_acc_2048: np.ndarray | None = None,
     return_details: bool = False,
     **hyperparams,
 ) -> np.ndarray | tuple[np.ndarray, dict]:
@@ -297,7 +323,8 @@ def lms_bucket(
     3. Runs the chosen single-pass LMS variant in parallel with the same hyperparameters
        on `ppg2` (`d_2[n]`) -> yields cleaned signal `e_2[n]`.
     4. Combines `e_1[n]` and `e_2[n]` via `snr_weighted_late_fusion(e1, e2, acc=acc)`
-       (penalizing residual accelerometer spectral peaks) to produce `e_fused[n]`.
+       (weighting by motion-penalized spectral concentration and inverse accelerometer
+       correlation) to produce `e_fused[n]`.
 
     Parameters
     ----------
@@ -310,10 +337,12 @@ def lms_bucket(
         of shape `(4, N)`.
     algorithm : {'standard_lms', 'lms', 'nlms', 'vs_lms'}, default='standard_lms'
         Name of the LMS algorithm variant to execute.
-    M : int, default=16
+    M : int, default=10
         Filter order (number of taps per reference channel; total taps = 4 * M).
     w_init : np.ndarray, optional
         Initial weight vector `w[0]` of shape `(4 * M,)`. Defaults to zeros.
+    psd_acc_2048 : np.ndarray, optional
+        Precomputed mean normalized 3-axis accelerometer PSD in `[0.5, 4.0]` Hz at `nfft=2048`.
     return_details : bool, default=False
         If False (default), returns only the fused cardiac signal `e_fused`.
         If True, returns `(e_fused, details_dict)`.
@@ -321,7 +350,7 @@ def lms_bucket(
         Algorithm-specific hyperparameters passed directly to the chosen LMS function:
         - For `'standard_lms'`: `mu` (or `my`)
         - For `'nlms'`: `mu` (or `my`), `delta`
-        - For `'vs_lms'`: `mu_max`, `mu_min`, `alpha`, `gamma`, `mu_init`
+        - For `'vs_lms'`: `mu_max`, `mu_min`, `alpha`, `gamma`, `delta`, `mu_init`
 
     Returns
     -------
@@ -350,6 +379,7 @@ def lms_bucket(
         e1,
         e2,
         acc=acc,
+        psd_acc_band=psd_acc_2048,
         return_weights=True,
     )
 

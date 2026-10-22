@@ -1,6 +1,6 @@
 """
 Joint Hyperparameter Optimization module using a 2-Phase Tree-structured Parzen Estimator (TPE)
-with Subject-Wise Group K-Fold Cross-Validation and Early Pruning.
+with Subject-Wise Group K-Fold Cross-Validation, Precomputed Spectral Caching, and Early Pruning.
 
 Architecture:
 1. Conditional Tree Search Space (Single-Pass 4M-Tap MISO LMS + HR Detection):
@@ -8,14 +8,14 @@ Architecture:
      * `lms_algorithm` in {'standard_lms', 'nlms', 'vs_lms'}
      * `hr_algorithm`  in {'periodogram', 'elgendi'}
    - Level 2 (Conditioned Continuous / Discrete Sub-Parameters):
-     * Conditioned on `lms_algorithm` (with M in [8, 24] -> total taps 4M in [32, 96]):
-       - `standard_lms`: `M` in [8, 24], `mu` in [5e-4, 0.02]
-       - `nlms`:         `M` in [8, 24], `mu` in [0.05, 0.8], `delta` in [1e-4, 1e-1]
-       - `vs_lms`:       `M` in [8, 24], `mu_max` in [0.005, 0.08], `mu_min` in [1e-4, 0.005],
-                         `alpha` in [0.90, 0.995], `gamma` in [1e-4, 1e-2]
+     * Conditioned on `lms_algorithm` (with M in [4, 15] -> total taps 4M in [16, 60]):
+       - `standard_lms`: `M` in [4, 15], `mu` in [1e-4, 0.006]
+       - `nlms`:         `M` in [4, 15], `mu` in [0.015, 0.25], `delta` in [0.01, 0.5]
+       - `vs_lms`:       `M` in [4, 15], `mu_max` in [0.02, 0.30], `mu_min` in [0.001, 0.02],
+                         `alpha` in [0.92, 0.995], `gamma` in [1e-4, 0.02]
      * Conditioned on `hr_algorithm`:
-       - `periodogram`:  `nfft` in {8192, 16384}, `window_type` in {'hann', 'hamming', 'blackman'},
-                         `suppression_alpha` in [0.2, 0.85], `harmonic_weight` in [0.1, 0.6]
+       - `periodogram`:  `nfft` in {4096, 8192}, `window_type` in {'hann', 'hamming', 'blackman'},
+                         `suppression_alpha` in [0.05, 0.50], `harmonic_weight` in [0.05, 0.50]
        - `elgendi`:      `w1_sec` in [0.08, 0.16], `w2_sec` in [0.55, 0.85],
                          `beta_offset` in [0.005, 0.10]
 
@@ -25,13 +25,14 @@ Architecture:
    - Each window `(5, 1000)` is filtered in a single forward pass and evaluated individually.
 
 3. 2-Phase Bayesian Optimization with Early Pruning:
-   - Phase 1 (Decoupled Fast Screening via Motion-Suppressed Spectral SNR Proxy):
-     Uses TPE to screen LMS filter configurations by maximizing the motion-suppressed
-     in-band cardiac Spectral SNR (`estimate_cardiac_snr`) on a subset of individual windows.
+   - Phase 1 (Decoupled Fast Screening via Supervised Ground-Truth Spectral SNR):
+     Screens LMS filter configurations across all 3 LMS families (12 trials per family)
+     using `supervised_cardiac_snr` against training ground-truth `y` (penalizing filters
+     that fail to adapt).
    - Phase 2 (End-to-End TPE Optimization with Early Pruning):
-     Warm-starts from the top Phase 1 LMS configurations and jointly optimizes both the
-     LMS filter and the HR detector across Subject-Wise Group K-Fold splits using the
-     outlier-penalized composite `objective_function` and `MedianFoldPruner` early stopping.
+     Evaluates all warm-start `(LMS x HR)` pairs over all 5 folds without pruning (ensuring
+     fair 5-fold comparison across all 6 algorithm pairs), and then uses TPE + `MedianFoldPruner`
+     to jointly optimize the full hyperparameter tree.
 """
 
 import numpy as np
@@ -40,12 +41,20 @@ from .dataset_preparation import FS, subject_wise_group_kfold
 from .preprocessing import prepare_channels
 from .reference_construction import build_U
 from .LMS_algorithms import LMS_REGISTRY
-from .fusion import estimate_cardiac_snr, snr_weighted_late_fusion
-from .bpm_detection import estimate_bpm_window, objective_function
+from .fusion import (
+    compute_acc_linear_psd_band,
+    snr_weighted_late_fusion,
+    supervised_cardiac_snr,
+)
+from .bpm_detection import (
+    estimate_bpm_window,
+    objective_function,
+    precompute_acc_psd_band,
+)
 from .pipeline import HeartRateEstimatorModel
 
-# Maximum filter order M in the search space (4 channels * 24 taps = 96 total MISO taps)
-MAX_M: int = 24
+# Maximum filter order M in the search space (4 channels * 15 taps = 60 total MISO taps)
+MAX_M: int = 15
 
 # ============================================================================
 # Conditional Tree Hyperparameter Search Space Definition
@@ -55,28 +64,28 @@ CONDITIONAL_SEARCH_SPACE: dict = {
     "hr_algorithm": ["periodogram", "elgendi"],
     "lms_subspaces": {
         "standard_lms": {
-            "M": ("int", 8, MAX_M),
-            "mu": ("log_float", 5e-4, 2e-2),
+            "M": ("int", 4, MAX_M),
+            "mu": ("log_float", 1e-4, 0.006),
         },
         "nlms": {
-            "M": ("int", 8, MAX_M),
-            "mu": ("log_float", 0.05, 0.8),
-            "delta": ("log_float", 1e-4, 1e-1),
+            "M": ("int", 4, MAX_M),
+            "mu": ("log_float", 0.015, 0.25),
+            "delta": ("log_float", 0.01, 0.5),
         },
         "vs_lms": {
-            "M": ("int", 8, MAX_M),
-            "mu_max": ("log_float", 0.005, 0.08),
-            "mu_min": ("log_float", 1e-4, 0.005),
-            "alpha": ("float", 0.90, 0.995),
-            "gamma": ("log_float", 1e-4, 1e-2),
+            "M": ("int", 4, MAX_M),
+            "mu_max": ("log_float", 0.02, 0.30),
+            "mu_min": ("log_float", 0.001, 0.02),
+            "alpha": ("float", 0.92, 0.995),
+            "gamma": ("log_float", 1e-4, 0.02),
         },
     },
     "hr_subspaces": {
         "periodogram": {
-            "nfft": ("choice", [8192, 16384]),
+            "nfft": ("choice", [4096, 8192]),
             "window_type": ("choice", ["hann", "hamming", "blackman"]),
-            "suppression_alpha": ("float", 0.2, 0.85),
-            "harmonic_weight": ("float", 0.1, 0.6),
+            "suppression_alpha": ("float", 0.05, 0.50),
+            "harmonic_weight": ("float", 0.05, 0.50),
         },
         "elgendi": {
             "w1_sec": ("float", 0.08, 0.16),
@@ -193,13 +202,18 @@ class ConditionalTPE:
             return int(np.clip(round(best_cand), low, high))
         return best_cand
 
-    def _split_good_bad(self) -> tuple[list[dict], list[dict]]:
+    def _split_good_bad(
+        self, subset: list[tuple[dict, float]] | None = None
+    ) -> tuple[list[dict], list[dict]]:
         """Partition observed configurations into good (`l`) and bad (`g`) sets."""
-        losses = np.array([loss for _, loss in self.trials], dtype=float)
+        pool = self.trials if subset is None else subset
+        if not pool:
+            return [], []
+        losses = np.array([loss for _, loss in pool], dtype=float)
         n_good = max(1, int(np.ceil(self.gamma_quantile * len(losses))))
         order = np.argsort(losses)
-        good_configs = [self.trials[i][0] for i in order[:n_good]]
-        bad_configs = [self.trials[i][0] for i in order[n_good:]]
+        good_configs = [pool[i][0] for i in order[:n_good]]
+        bad_configs = [pool[i][0] for i in order[n_good:]]
         return good_configs, bad_configs
 
     def sample_lms_node(self, forced_lms_algo: str | None = None) -> dict:
@@ -221,12 +235,18 @@ class ConditionalTPE:
                 lms_algo = self._sample_param_prior(lms_spec)
 
         subspace = CONDITIONAL_SEARCH_SPACE["lms_subspaces"][lms_algo]
-        good_branch = [c["lms_params"] for c in good_cfgs if c["lms_algorithm"] == lms_algo]
-        bad_branch = [c["lms_params"] for c in bad_cfgs if c["lms_algorithm"] == lms_algo]
+        algo_trials = [(c, loss) for c, loss in self.trials if c.get("lms_algorithm") == lms_algo]
+        if len(algo_trials) >= 4:
+            good_algo, bad_algo = self._split_good_bad(algo_trials)
+            good_branch = [c["lms_params"] for c in good_algo]
+            bad_branch = [c["lms_params"] for c in bad_algo]
+        else:
+            good_branch = [c["lms_params"] for c in good_cfgs if c["lms_algorithm"] == lms_algo]
+            bad_branch = [c["lms_params"] for c in bad_cfgs if c["lms_algorithm"] == lms_algo]
 
         lms_params = {}
         for pname, pspec in subspace.items():
-            if use_tpe and len(good_branch) >= 2 and len(bad_branch) >= 2:
+            if len(good_branch) >= 2 and len(bad_branch) >= 2:
                 lms_params[pname] = self._sample_tpe_1d(
                     pspec,
                     [p[pname] for p in good_branch],
@@ -257,20 +277,30 @@ class ConditionalTPE:
             hr_algo = self._sample_param_prior(hr_spec)
 
         hr_subspace = CONDITIONAL_SEARCH_SPACE["hr_subspaces"][hr_algo]
-        good_hr = [
-            c["hr_params"]
-            for c in good_cfgs
+        hr_trials = [
+            (c, loss)
+            for c, loss in self.trials
             if c.get("hr_algorithm") == hr_algo and "hr_params" in c
         ]
-        bad_hr = [
-            c["hr_params"]
-            for c in bad_cfgs
-            if c.get("hr_algorithm") == hr_algo and "hr_params" in c
-        ]
+        if len(hr_trials) >= 4:
+            good_hr_cfgs, bad_hr_cfgs = self._split_good_bad(hr_trials)
+            good_hr = [c["hr_params"] for c in good_hr_cfgs]
+            bad_hr = [c["hr_params"] for c in bad_hr_cfgs]
+        else:
+            good_hr = [
+                c["hr_params"]
+                for c in good_cfgs
+                if c.get("hr_algorithm") == hr_algo and "hr_params" in c
+            ]
+            bad_hr = [
+                c["hr_params"]
+                for c in bad_cfgs
+                if c.get("hr_algorithm") == hr_algo and "hr_params" in c
+            ]
 
         hr_params = {}
         for pname, pspec in hr_subspace.items():
-            if use_tpe and len(good_hr) >= 2 and len(bad_hr) >= 2:
+            if len(good_hr) >= 2 and len(bad_hr) >= 2:
                 hr_params[pname] = self._sample_tpe_1d(
                     pspec,
                     [p[pname] for p in good_hr],
@@ -294,9 +324,9 @@ class MedianFoldPruner:
     """Early pruning mechanism for multi-fold cross-validation trials.
 
     Tracks intermediate cumulative validation scores after each fold `k`.
-    Once at least `n_warmup_trials` have completed fold `k`, any subsequent trial
-    whose cumulative error after fold `k` exceeds the `percentile` threshold
-    of previous trials at step `k` is pruned early.
+    Warm-start trials record their fold scores into `step_history` without being pruned.
+    Subsequent TPE trials whose cumulative error after fold `k` exceeds the `percentile`
+    threshold of previous trials at step `k` are pruned early.
     """
 
     def __init__(
@@ -308,14 +338,16 @@ class MedianFoldPruner:
         self.percentile = percentile
         self.step_history: dict[int, list[float]] = {}
 
-    def report_and_check_prune(self, step: int, running_score: float) -> bool:
+    def report_and_check_prune(
+        self, step: int, running_score: float, allow_prune: bool = True
+    ) -> bool:
         """Report intermediate running score at fold `step` and return True if trial should prune."""
         if not np.isfinite(running_score):
             return True
 
         history = self.step_history.setdefault(step, [])
         should_prune = False
-        if len(history) >= self.n_warmup_trials:
+        if allow_prune and len(history) >= self.n_warmup_trials:
             threshold = float(np.percentile(history, self.percentile))
             if running_score > threshold:
                 should_prune = True
@@ -325,7 +357,7 @@ class MedianFoldPruner:
 
 
 # ============================================================================
-# Fast Preprocessed Window & 4-Channel MISO Regressor Cache
+# Fast Preprocessed Window, 4-Channel MISO Regressor & Precomputed PSD Cache
 # ============================================================================
 def preprocess_dataset_windows(
     X: np.ndarray,
@@ -333,75 +365,122 @@ def preprocess_dataset_windows(
     hi: float = 4.0,
     fs: float = FS,
     max_M: int = MAX_M,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """Preprocess each 5D window `(5, N)` into 6 normalized channels and prebuild `U_max`.
+) -> list[tuple]:
+    """Preprocess each 5D window `(5, N)` and precompute `U_max` and accelerometer spectra.
 
-    Uses `prepare_channels` to compute the 4th accelerometer magnitude channel `acc_mag`,
-    apply 3rd-order zero-phase Butterworth bandpass filtering (`0.5 - 4.0` Hz), and
-    normalize to unit variance. Precomputes `U_max` of shape `(N, 4, max_M)` once per
-    window so any `U` of order `M <= max_M` can be extracted instantaneously via
-    `U_max[:, :, :M].reshape(N, 4 * M)`.
+    For each window, precomputes and caches:
+    - `ppg1`, `ppg2`: normalized PPG channels of shape `(N,)`
+    - `acc_norm`: 4-channel normalized accelerometer reference of shape `(4, N)`
+    - `U_max_3d`: 4-channel MISO delay tensor of shape `(N, 4, max_M)`
+    - `psd_acc_2048`: mean normalized 3-axis accelerometer PSD for `fusion.py` (`nfft=2048`)
+    - `psd_acc_4096`: mean normalized 3-axis accelerometer PSD for `bpm_detection.py` (`nfft=4096`)
+    - `psd_acc_8192`: mean normalized 3-axis accelerometer PSD for `bpm_detection.py` (`nfft=8192`)
+    - `a_unit_3`: unit-norm zero-mean 3-axis linear accelerometer matrix of shape `(3, N)`
 
-    Returns
-    -------
-    list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
-        List of `(ppg1, ppg2, acc_norm, U_max_3d)` tuples, one per window, where
-        `acc_norm` has shape `(4, N)` and `U_max_3d` has shape `(N, 4, max_M)`.
+    Because accelerometer spectra depend only on `acc_norm[:3]`, precomputing them once per
+    window eliminates all accelerometer FFT computations during Phase 1 and Phase 2 trials.
     """
+    eps = 1e-12
     cached = []
     for w in X:
         ppg_norm, acc_norm = prepare_channels(w, fs=fs, lo=lo, hi=hi, order=3, causal=False)
         ppg1, ppg2 = ppg_norm[0], ppg_norm[1]
         N = len(ppg1)
         U_full = build_U(acc_norm, max_M).reshape(N, 4, max_M)
-        cached.append((ppg1, ppg2, acc_norm, U_full))
+
+        psd_acc_2048 = compute_acc_linear_psd_band(acc_norm, nfft=2048, fs=fs, lo=0.5, hi=4.0)
+        psd_acc_4096 = precompute_acc_psd_band(acc_norm, nfft=4096, fs=fs, lo=0.5, hi=3.8)
+        psd_acc_8192 = precompute_acc_psd_band(acc_norm, nfft=8192, fs=fs, lo=0.5, hi=3.8)
+
+        acc3_c = acc_norm[:3] - np.mean(acc_norm[:3], axis=-1, keepdims=True)
+        a_unit_3 = acc3_c / (np.linalg.norm(acc3_c, axis=-1, keepdims=True) + eps)
+
+        cached.append(
+            (
+                ppg1,
+                ppg2,
+                acc_norm,
+                U_full,
+                psd_acc_2048,
+                psd_acc_4096,
+                psd_acc_8192,
+                a_unit_3,
+            )
+        )
     return cached
 
 
 def _filter_cached_window(
-    ppg1: np.ndarray,
-    ppg2: np.ndarray,
-    acc_norm: np.ndarray,
-    U_max_3d: np.ndarray,
+    cached_win: tuple,
     lms_algo: str,
     M: int,
     lms_params: dict,
-) -> np.ndarray:
-    """Run single-pass parallel 4M-tap MISO LMS + motion-suppressed Late Fusion."""
+    return_m_hat: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run single-pass parallel 4M-tap MISO LMS + motion-suppressed Late Fusion using cached spectra."""
+    ppg1, ppg2, acc_norm, U_max_3d = cached_win[:4]
+    psd_acc_2048 = cached_win[4] if len(cached_win) > 4 else None
+    a_unit_3 = cached_win[7] if len(cached_win) > 7 else None
+
     N = len(ppg1)
     U = U_max_3d[:, :, :M].reshape(N, 4 * M)
     lms_fn = LMS_REGISTRY[lms_algo]
-    e1, _, _ = lms_fn(ppg1, U, M=M, **lms_params)
-    e2, _, _ = lms_fn(ppg2, U, M=M, **lms_params)
-    return snr_weighted_late_fusion(e1, e2, acc=acc_norm, return_weights=False)
+    e1, m_hat1, _ = lms_fn(ppg1, U, M=M, **lms_params)
+    e2, m_hat2, _ = lms_fn(ppg2, U, M=M, **lms_params)
+
+    if return_m_hat:
+        e_fused, f_info = snr_weighted_late_fusion(
+            e1,
+            e2,
+            acc=acc_norm,
+            psd_acc_band=psd_acc_2048,
+            a_unit_3=a_unit_3,
+            return_weights=True,
+        )
+        w1, w2 = f_info["w1"], f_info["w2"]
+        m_hat_fused = w1 * m_hat1 + w2 * m_hat2
+        d_fused = w1 * ppg1 + w2 * ppg2
+        return e_fused, m_hat_fused, d_fused
+
+    return snr_weighted_late_fusion(
+        e1,
+        e2,
+        acc=acc_norm,
+        psd_acc_band=psd_acc_2048,
+        a_unit_3=a_unit_3,
+        return_weights=False,
+    )
 
 
 # ============================================================================
-# Phase 1: Decoupled Fast Screening via Motion-Suppressed Spectral SNR Proxy
+# Phase 1: Decoupled Fast Screening via Supervised Ground-Truth Cardiac SNR
 # ============================================================================
 def run_phase1_snr_screening(
-    preprocessed_windows: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    preprocessed_windows: list[tuple],
+    y: np.ndarray,
     screening_indices: np.ndarray,
-    n_trials: int = 25,
+    n_trials: int = 36,
     top_k: int = 6,
     seed: int = 42,
 ) -> tuple[list[dict], list[dict]]:
-    """Phase 1: Decoupled Fast Screening of LMS hyperparameters using the Spectral SNR Proxy.
+    """Phase 1: Supervised Fast Screening of LMS hyperparameters using Ground-Truth Cardiac SNR.
 
-    Evaluates candidate single-pass LMS configurations (`standard_lms`, `nlms`, `vs_lms`)
-    on a screening subset of individual windows by maximizing the motion-suppressed
-    in-band cardiac Spectral SNR (`estimate_cardiac_snr(e_fused, acc=acc_norm)`).
+    Evaluates candidate single-pass LMS configurations (`standard_lms`, `nlms`, `vs_lms`,
+    12 trials per family) on `screening_indices` by maximizing `supervised_cardiac_snr`
+    around the true heart rate `f_true = y[idx] / 60` and `2 * f_true` while penalizing
+    filters that fail to adapt (`||m_hat||_2 <= 0.02 * ||d||_2`).
     """
     lms_families = CONDITIONAL_SEARCH_SPACE["lms_algorithm"]
     tpe = ConditionalTPE(
         seed=seed,
         gamma_quantile=0.25,
-        n_startup_trials=min(9, max(3, n_trials // 3)),
+        n_startup_trials=12,
     )
     phase1_history = []
 
     for trial_idx in range(n_trials):
-        forced_algo = lms_families[trial_idx % len(lms_families)] if trial_idx < 9 else None
+        # Cycle evenly across all 3 LMS families (12 trials per family when n_trials=36)
+        forced_algo = lms_families[trial_idx % len(lms_families)]
         candidate = tpe.sample_lms_node(forced_lms_algo=forced_algo)
         lms_algo = candidate["lms_algorithm"]
         lms_params = dict(candidate["lms_params"])
@@ -410,14 +489,22 @@ def run_phase1_snr_screening(
         snr_scores = []
         diverged = False
         for idx in screening_indices:
-            ppg1, ppg2, acc_norm, U_max_3d = preprocessed_windows[int(idx)]
-            e_fused = _filter_cached_window(
-                ppg1, ppg2, acc_norm, U_max_3d, lms_algo, M, lms_params
+            w_idx = int(idx)
+            cached_win = preprocessed_windows[w_idx]
+            e_fused, m_hat_fused, d_fused = _filter_cached_window(
+                cached_win, lms_algo, M, lms_params, return_m_hat=True
             )
             if not np.all(np.isfinite(e_fused)):
                 diverged = True
                 break
-            snr_scores.append(estimate_cardiac_snr(e_fused, acc=acc_norm))
+            snr_val = supervised_cardiac_snr(
+                e_fused,
+                bpm_true=float(y[w_idx]),
+                m_hat=m_hat_fused,
+                d=d_fused,
+                nfft=4096,
+            )
+            snr_scores.append(snr_val)
 
         mean_snr = 0.0 if (diverged or not snr_scores) else float(np.mean(snr_scores))
         loss = -mean_snr if mean_snr > 0.0 else 1e6
@@ -468,36 +555,30 @@ def run_phase1_snr_screening(
 # Phase 2: End-to-End TPE Optimization with Subject-Wise Group K-Fold & Pruning
 # ============================================================================
 def run_phase2_tpe_optimization(
-    preprocessed_windows: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    preprocessed_windows: list[tuple],
     y: np.ndarray,
     splits: list[tuple[np.ndarray, np.ndarray]],
     seed_lms_configs: list[dict],
-    n_trials: int = 30,
+    n_trials: int = 45,
     prune_percentile: float = 50.0,
     seed: int = 42,
 ) -> tuple[dict, float, list[dict]]:
     """Phase 2: End-to-End Joint TPE Optimization with Early Pruning across Group K-Folds.
 
-    Jointly optimizes the full conditional hyperparameter tree (`lms_algorithm` + sub-parameters
-    and `hr_algorithm` + sub-parameters, including `suppression_alpha` and `harmonic_weight`)
-    by minimizing `objective_function` across Subject-Wise Group K-Fold splits.
+    - Warm-start trials (`trial_idx < len(warm_start_queue)`) are never pruned so all 6
+      `(LMS x HR)` algorithm pairs are guaranteed a complete 5-fold evaluation.
+    - Only completed (unpruned) 5-fold trials are fed into `tpe.observe` so TPE's Parzen
+      densities are never skewed by single-fold scores.
     """
-    tpe = ConditionalTPE(
-        seed=seed + 100,
-        gamma_quantile=0.25,
-        n_startup_trials=max(6, len(seed_lms_configs)),
-    )
-    pruner = MedianFoldPruner(n_warmup_trials=6, percentile=prune_percentile)
-
     warm_start_queue: list[dict] = []
     for lms_cfg in seed_lms_configs:
         for hr_algo in CONDITIONAL_SEARCH_SPACE["hr_algorithm"]:
             hr_default = (
                 {
-                    "nfft": 16384,
+                    "nfft": 4096,
                     "window_type": "hamming",
-                    "suppression_alpha": 0.6,
-                    "harmonic_weight": 0.35,
+                    "suppression_alpha": 0.25,
+                    "harmonic_weight": 0.25,
                 }
                 if hr_algo == "periodogram"
                 else {"w1_sec": 0.111, "w2_sec": 0.667, "beta_offset": 0.02}
@@ -511,12 +592,23 @@ def run_phase2_tpe_optimization(
                 }
             )
 
+    tpe = ConditionalTPE(
+        seed=seed + 100,
+        gamma_quantile=0.25,
+        n_startup_trials=max(8, len(warm_start_queue)),
+    )
+    pruner = MedianFoldPruner(
+        n_warmup_trials=max(6, len(warm_start_queue)),
+        percentile=prune_percentile,
+    )
+
     best_config: dict | None = None
     best_score: float = float("inf")
     phase2_history: list[dict] = []
 
     for trial_idx in range(n_trials):
-        if trial_idx < len(warm_start_queue):
+        is_warm_start = trial_idx < len(warm_start_queue)
+        if is_warm_start:
             config = warm_start_queue[trial_idx]
         else:
             config = tpe.sample_full_tree()
@@ -526,6 +618,7 @@ def run_phase2_tpe_optimization(
         M = int(lms_params.pop("M"))
         hr_algo = config["hr_algorithm"]
         hr_params = dict(config["hr_params"])
+        hr_nfft = int(hr_params.get("nfft", 4096))
 
         fold_obj_scores = []
         fold_aaes = []
@@ -536,14 +629,20 @@ def run_phase2_tpe_optimization(
             val_targets = y[val_indices]
 
             for w_idx in val_indices:
-                ppg1, ppg2, acc_norm, U_max_3d = preprocessed_windows[int(w_idx)]
+                cached_win = preprocessed_windows[int(w_idx)]
+                acc_norm = cached_win[2]
+                psd_acc_hr = None
+                if len(cached_win) > 6:
+                    psd_acc_hr = cached_win[5] if hr_nfft == 4096 else cached_win[6]
+
                 e_fused = _filter_cached_window(
-                    ppg1, ppg2, acc_norm, U_max_3d, lms_algo, M, lms_params
+                    cached_win, lms_algo, M, lms_params, return_m_hat=False
                 )
                 bpm_hat = estimate_bpm_window(
                     e_fused,
                     hr_algorithm=hr_algo,
                     acc_norm=acc_norm,
+                    psd_acc_band=psd_acc_hr,
                     **hr_params,
                 )
                 val_preds.append(bpm_hat)
@@ -559,13 +658,21 @@ def run_phase2_tpe_optimization(
             fold_aaes.append(fold_aae)
             running_obj = float(np.mean(fold_obj_scores))
 
-            if pruner.report_and_check_prune(step=fold_idx, running_score=running_obj):
+            # Do NOT prune warm-start trials so all 6 (LMS x HR) pairs complete all 5 folds
+            if pruner.report_and_check_prune(
+                step=fold_idx,
+                running_score=running_obj,
+                allow_prune=not is_warm_start,
+            ):
                 pruned = True
                 break
 
         final_obj = float(np.mean(fold_obj_scores)) if fold_obj_scores else float("inf")
         final_aae = float(np.mean(fold_aaes)) if fold_aaes else float("inf")
-        tpe.observe(config, final_obj)
+
+        # Only feed completed 5-fold evaluations into TPE so scores stay on a consistent scale
+        if not pruned and np.isfinite(final_obj):
+            tpe.observe(config, final_obj)
 
         if not pruned and final_obj < best_score:
             best_score = final_obj
@@ -630,10 +737,10 @@ def optimize_hr_pipeline(
     X: np.ndarray,
     y: np.ndarray,
     n_splits: int = 5,
-    phase1_trials: int = 25,
-    phase1_sample_size: int = 120,
+    phase1_trials: int = 36,
+    phase1_sample_size: int = 250,
     phase1_top_k: int = 6,
-    phase2_trials: int = 30,
+    phase2_trials: int = 45,
     prune_percentile: float = 50.0,
     seed: int = 42,
 ) -> dict:
@@ -668,6 +775,7 @@ def optimize_hr_pipeline(
 
     top_lms_configs, phase1_history = run_phase1_snr_screening(
         preprocessed_windows=preprocessed_windows,
+        y=y,
         screening_indices=screening_indices,
         n_trials=phase1_trials,
         top_k=phase1_top_k,

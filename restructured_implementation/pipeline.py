@@ -11,9 +11,10 @@ Processes each 5-dimensional window `[ppg1, ppg2, accx, accy, accz]` of length N
 3. Single-Pass Adaptive MISO LMS Filtering + Late Fusion (`LMS_algorithms.py` & `fusion.py`):
    - Parallel single-pass filtering of `ppg1` and `ppg2` against `acc_norm` (4, N)
      using the chosen LMS variant (`standard_lms`, `nlms`, or `vs_lms`) followed by
-     Motion-Suppressed SNR-Weighted Averaging.
+     Motion-Suppressed Spectral Concentration & Inverse Correlation Late Fusion.
 4. Heart Rate Detection (`bpm_detection.py`):
-   - Estimates BPM per window via `motion_suppressed_periodogram_bpm` or `elgendi_systolic_peak_bpm`.
+   - Estimates BPM per window via `motion_suppressed_periodogram_bpm` (with additive soft
+     spectral subtraction and parabolic peak interpolation) or `elgendi_systolic_peak_bpm`.
 """
 
 import numpy as np
@@ -27,7 +28,7 @@ from .bpm_detection import estimate_bpm_window
 def reconstruct_heart_signal(
     window_5d: np.ndarray,
     lms_algorithm: str = "standard_lms",
-    M: int = 16,
+    M: int = 10,
     lo: float = 0.5,
     hi: float = 4.0,
     fs: float = FS,
@@ -45,7 +46,7 @@ def reconstruct_heart_signal(
         `[ppg1, ppg2, accx, accy, accz]`.
     lms_algorithm : {'standard_lms', 'nlms', 'vs_lms'}, default='standard_lms'
         LMS algorithm variant to execute in the single-pass parallel filtering stage.
-    M : int, default=16
+    M : int, default=10
         Number of FIR taps per accelerometer channel (total MISO weights = 4 * M).
     lo : float, default=0.5
         Bandpass lower cutoff frequency in Hz (30 BPM = 0.5 Hz).
@@ -63,7 +64,7 @@ def reconstruct_heart_signal(
         Conditioned hyperparameters for the chosen LMS variant:
         - `standard_lms`: `mu` (or `my`)
         - `nlms`: `mu` (or `my`), `delta`
-        - `vs_lms`: `mu_max`, `mu_min`, `alpha`, `gamma`
+        - `vs_lms`: `mu_max`, `mu_min`, `alpha`, `gamma`, `delta`
 
     Returns
     -------
@@ -105,7 +106,7 @@ def reconstruct_heart_signal(
 def predict_window_bpm(
     window_5d: np.ndarray,
     lms_algorithm: str = "standard_lms",
-    M: int = 16,
+    M: int = 10,
     lms_params: dict | None = None,
     hr_algorithm: str = "periodogram",
     hr_params: dict | None = None,

@@ -29,11 +29,14 @@ from .LMS_algorithms import (
     lms_bucket,
 )
 from .fusion import (
+    compute_acc_linear_psd_band,
+    supervised_cardiac_snr,
     estimate_cardiac_snr,
     compute_snr_weights,
     snr_weighted_late_fusion,
 )
 from .bpm_detection import (
+    precompute_acc_psd_band,
     motion_suppressed_periodogram_bpm,
     zero_padded_periodogram_bpm,
     bpm_from_window,
@@ -76,9 +79,12 @@ __all__ = [
     "nlms",
     "vs_lms",
     "lms_bucket",
+    "compute_acc_linear_psd_band",
+    "supervised_cardiac_snr",
     "estimate_cardiac_snr",
     "compute_snr_weights",
     "snr_weighted_late_fusion",
+    "precompute_acc_psd_band",
     "motion_suppressed_periodogram_bpm",
     "zero_padded_periodogram_bpm",
     "bpm_from_window",
